@@ -2112,12 +2112,6 @@ func (db *DB) deleteValue(offset int64) error {
 // readValue reads a value from the cache or values file
 func (db *DB) readValue(offset int64, maxReadSeq ...int64) ([]byte, error) {
 
-	// Not in cache, read from values file
-	// Values start at PageSize (4096) due to header
-	if offset < PageSize || offset >= db.valuesFileSize {
-		return nil, fmt.Errorf("offset out of values file bounds: %d", offset)
-	}
-
 	// Determine the maximum transaction sequence number that can be read
 	var maxReadSequence int64
 	if len(maxReadSeq) > 0 && maxReadSeq[0] > 0 {
@@ -2154,6 +2148,12 @@ func (db *DB) readValue(offset int64, maxReadSeq ...int64) ([]byte, error) {
 	if exists {
 		// Return the cached value (nil for deleted values)
 		return entry.value, nil
+	}
+
+	// Not in cache, read from values file
+	// Values start at PageSize (4096) due to header
+	if offset < PageSize || offset >= db.valuesFileSize {
+		return nil, fmt.Errorf("offset out of values file bounds: %d", offset)
 	}
 
 	// Read the type byte first

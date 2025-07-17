@@ -376,6 +376,8 @@ func (db *DB) scanWAL() error {
 		return nil
 	}
 
+	debugPrint("Scanning WAL file\n")
+
 	// Read WAL header first
 	headerBuf := make([]byte, WalHeaderSize)
 	if _, err := db.walInfo.file.ReadAt(headerBuf, 0); err != nil {
@@ -437,6 +439,7 @@ func (db *DB) scanWAL() error {
 		frameSalt2 := binary.BigEndian.Uint32(frameHeader[17:21])
 		if frameSalt1 != db.walInfo.salt1 || frameSalt2 != db.walInfo.salt2 {
 			// Salt mismatch, stop scanning
+			debugPrint("Salt mismatch: %d vs %d, %d vs %d\n", frameSalt1, db.walInfo.salt1, frameSalt2, db.walInfo.salt2)
 			break
 		}
 
@@ -450,10 +453,12 @@ func (db *DB) scanWAL() error {
 		if frameType == WalFrameTypeCommit {
 			// This is a commit record, update lastCommitOffset
 			// Commit records have no data, just the header
+			debugPrint("Processing commit record for transaction %d\n", commitSequence)
 
 			// Verify checksum
 			if frameChecksum != runningChecksum {
 				// Checksum mismatch, stop scanning
+				debugPrint("Commit checksum mismatch: %d vs %d\n", frameChecksum, runningChecksum)
 				break
 			}
 
@@ -466,6 +471,7 @@ func (db *DB) scanWAL() error {
 			// Clean up old page versions after commit
 			localCache.discardOldPageVersions()
 
+			// Checkpoint the content of this commit
 			if !db.readOnly {
 				// Copy these pages and values to the files
 				db.copyPagesToIndexFile(localCache, commitSequence)
@@ -485,6 +491,7 @@ func (db *DB) scanWAL() error {
 			// Ensure we don't read past the end of the file
 			pageSize := int64(PageSize)
 			if offset+WalFrameHeaderSize+pageSize > walFileInfo.Size() {
+				debugPrint("Page frame past end of file: %d vs %d\n", offset+WalFrameHeaderSize+pageSize, walFileInfo.Size())
 				break
 			}
 
@@ -495,6 +502,7 @@ func (db *DB) scanWAL() error {
 			pageData := make([]byte, pageSize)
 			if _, err := db.walInfo.file.ReadAt(pageData, offset+WalFrameHeaderSize); err != nil {
 				// Error reading page data, stop scanning
+				debugPrint("Error reading page data: %v\n", err)
 				break
 			}
 
@@ -504,8 +512,11 @@ func (db *DB) scanWAL() error {
 			// Verify checksum
 			if frameChecksum != runningChecksum {
 				// Checksum mismatch, stop scanning
+				debugPrint("Page checksum mismatch: %d vs %d\n", frameChecksum, runningChecksum)
 				break
 			}
+
+			debugPrint("Loading page %d from WAL to cache\n", pageNumber)
 
 			// Add the page directly to the in-memory cache
 			localCache.add(pageNumber, pageData, commitSequence)
@@ -523,12 +534,14 @@ func (db *DB) scanWAL() error {
 
 			// Ensure we don't read past the end of the file
 			if offset+WalFrameHeaderSize+int64(segmentSize) > walFileInfo.Size() {
+				debugPrint("Value frame past end of file: %d vs %d\n", offset+WalFrameHeaderSize+int64(segmentSize), walFileInfo.Size())
 				break
 			}
 
 			// Read the complete value data
 			segment := make([]byte, segmentSize)
 			if _, err := db.walInfo.file.ReadAt(segment, offset+WalFrameHeaderSize); err != nil {
+				debugPrint("Error reading value data: %v\n", err)
 				break
 			}
 
@@ -538,6 +551,7 @@ func (db *DB) scanWAL() error {
 			// Verify checksum
 			if frameChecksum != runningChecksum {
 				// Checksum mismatch, stop scanning
+				debugPrint("Value checksum mismatch: %d vs %d\n", frameChecksum, runningChecksum)
 				break
 			}
 
@@ -553,20 +567,25 @@ func (db *DB) scanWAL() error {
 				// Parse the actual value from the value data (skip type and size varint)
 				if segmentSize < 2 {
 					// Invalid value data size
+					debugPrint("Invalid value data size: %d\n", segmentSize)
 					break
 				}
 				// Parse the size varint to find where the actual value starts
 				valueSize64, bytesRead := varint.Read(segment[1:])
 				if bytesRead == 0 || 1+bytesRead+int(valueSize64) != segmentSize {
 					// Invalid value data format
+					debugPrint("Invalid value data format: %d\n", segmentSize)
 					break
 				}
 				// Normal value - extract the data (skip type and size)
 				actualValue = segment[1+bytesRead:]
 			} else {
 				// Unknown value type, skip this frame
+				debugPrint("Unknown value type: %d\n", valueType)
 				break
 			}
+
+			debugPrint("Loading value (offset: %d) from WAL to cache\n", valueOffset)
 
 			// Add the value to the value cache with versioning
 			db.valueCacheMutex.Lock()
@@ -585,6 +604,7 @@ func (db *DB) scanWAL() error {
 
 		} else {
 			// Unknown frame type, stop scanning
+			debugPrint("Unknown frame type: %d\n", frameType)
 			break
 		}
 	}
@@ -592,8 +612,9 @@ func (db *DB) scanWAL() error {
 	// If the last scanned position is beyond the last commit position, there were frames without a commit
 	// In this case, we need to remove all pages from the uncommitted transaction from the cache
 	if offset > lastCommitOffset {
-		// Remove pages from the current uncommitted transaction from the cache
+		// Remove pages and values from the current uncommitted transaction from the cache
 		localCache.discardNewerPages(commitSequence)
+		db.discardNewerValues(commitSequence)
 	}
 
 	// Update the position fields
@@ -757,6 +778,10 @@ func (db *DB) checkpointWAL() error {
 		return fmt.Errorf("failed to copy pages to index file: %w", err)
 	}
 
+	// Sync the values file to ensure all changes are persisted
+	if err := db.valuesFile.Sync(); err != nil {
+		return fmt.Errorf("failed to sync values file after checkpoint: %w", err)
+	}
 	// Sync the index file to ensure all changes are persisted
 	if err := db.indexFile.Sync(); err != nil {
 		return fmt.Errorf("failed to sync index file after checkpoint: %w", err)
@@ -826,9 +851,10 @@ func (db *DB) copyValuesToValuesFile(commitSequence int64) error {
 		return nil
 	}
 
+	var offsets []int64
+
 	// Get all values with the specified commit sequence
 	db.valueCacheMutex.RLock()
-	var offsets []int64
 	for offset, entry := range db.valueCache {
 		// Find the version with the specified commit sequence
 		for ; entry != nil; entry = entry.next {
