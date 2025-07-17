@@ -3747,8 +3747,7 @@ func TestHeaderReadingWithWAL(t *testing.T) {
 		t.Fatalf("Failed to set second key: %v", err)
 	}
 
-	// Store the current lastIndexedOffset (this should be in WAL but not in index file)
-	originalOffset := db.mainFileSize
+	// Store the current state (this should be in WAL but not in index file)
 	originalFreeHead := db.freeRadixPagesHead
 
 	// Close the database (will commit the changes to the WAL file)
@@ -3763,9 +3762,13 @@ func TestHeaderReadingWithWAL(t *testing.T) {
 		t.Fatalf("Failed to reopen database: %v", err)
 	}
 
-	// Verify that the lastIndexedOffset was read from WAL (should match original)
-	if db2.lastIndexedOffset != originalOffset {
-		t.Errorf("lastIndexedOffset mismatch: expected %d, got %d", originalOffset, db2.lastIndexedOffset)
+	// Verify that data written to WAL is accessible
+	value, err := db2.Get([]byte("another_key"))
+	if err != nil {
+		t.Errorf("Failed to get key from WAL: %v", err)
+	}
+	if string(value) != "another_value" {
+		t.Errorf("Value mismatch: expected 'another_value', got '%s'", string(value))
 	}
 
 	// Verify that the freeRadixPagesHead was read from WAL
@@ -3823,8 +3826,7 @@ func TestHeaderReadingWithoutWAL(t *testing.T) {
 		t.Fatalf("Failed to set third key: %v", err)
 	}
 
-	// Store the current mainFileSize for comparison
-	originalOffset := db.mainFileSize
+	// Store the current state for comparison
 	originalFreeHead := db.freeRadixPagesHead
 
 	// Close the database (will commit the changes to the WAL file)
@@ -3856,11 +3858,6 @@ func TestHeaderReadingWithoutWAL(t *testing.T) {
 	db3, err := Open(dbPath, Options{})
 	if err != nil {
 		t.Fatalf("Failed to reopen database final time: %v", err)
-	}
-
-	// Verify that the lastIndexedOffset was read correctly from index file
-	if db3.lastIndexedOffset != originalOffset {
-		t.Errorf("lastIndexedOffset mismatch: expected %d, got %d", originalOffset, db3.lastIndexedOffset)
 	}
 
 	// Verify that the freeRadixPagesHead was read correctly from index file

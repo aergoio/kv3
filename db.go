@@ -25,7 +25,6 @@ const (
 	// Page size (4KB)
 	PageSize = 4096
 	// Magic strings for database identification (6 bytes)
-	MainFileMagicString   string = "KV3LOG"
 	IndexFileMagicString  string = "KV3KEY"
 	ValuesFileMagicString string = "KV3VAL"
 	// Database version (2 bytes as a string)
@@ -121,16 +120,12 @@ type cacheBucket struct {
 type DB struct {
 	databaseID     uint64 // Unique identifier for the database
 	filePath       string
-	mainFile       *os.File
 	indexFile      *os.File
 	valuesFile     *os.File  // Values file for storing variable-size values
 	mutex          sync.RWMutex  // Mutex for the database
 	seqMutex       sync.Mutex    // Mutex for transaction state and sequence numbers
-	mainFileSize   int64 // Track main file size to avoid frequent stat calls
 	indexFileSize  int64 // Track index file size to avoid frequent stat calls
 	valuesFileSize int64 // Track values file size to avoid frequent stat calls
-	prevFileSize   int64 // Track main file size before the current transaction started
-	flushFileSize  int64 // Track main file size for flush operations
 	fileLocked     bool  // Track if the files are locked
 	lockType       int   // Type of lock currently held
 	readOnly       bool  // Track if the database is opened in read-only mode
@@ -139,7 +134,6 @@ type DB struct {
 	valueCache     map[int64]*ValueEntry // Value cache
 	valueCacheMutex sync.RWMutex         // Mutex for the value cache
 	freeRadixPagesHead uint32 // Page number of the head of linked list of radix pages with available sub-pages
-	lastIndexedOffset int64 // Track the offset of the last indexed content in the main file
 	writeMode      string // Current write mode
 	nextWriteMode  string // Next write mode to apply
 	commitMode     int    // CallerThread or WorkerThread
@@ -153,7 +147,6 @@ type DB struct {
 	flushSequence  int64  // Current flush up to this transaction sequence number
 	maxReadSequence int64 // Maximum transaction sequence number that can be read
 	pruningSequence int64 // Last transaction sequence number when cache pruning was performed
-	txnChecksum    uint32 // Running CRC32 checksum for current transaction
 	accessCounter  uint64 // Counter for page access times
 	dirtyPageCount int    // Count of dirty pages in cache
 	cacheSizeThreshold int // Maximum number of pages in cache before cleanup
@@ -254,11 +247,6 @@ func debugPrint(format string, args ...interface{}) {
 // Open opens or creates a database file with the given options
 func Open(path string, options ...Options) (*DB, error) {
 
-	mainFileExists := false
-	if _, err := os.Stat(path); err == nil {
-		mainFileExists = true
-	}
-
 	// Generate index file path by adding '-keys' suffix
 	indexPath := path + "-keys"
 	indexFileExists := false
@@ -273,20 +261,16 @@ func Open(path string, options ...Options) (*DB, error) {
 		valuesFileExists = true
 	}
 
-	if !mainFileExists && indexFileExists {
-		// Remove index file if main file doesn't exist
-		os.Remove(indexPath)
-		indexFileExists = false
+	// Both files must exist or both must not exist
+	if indexFileExists != valuesFileExists {
+		if indexFileExists {
+			return nil, fmt.Errorf("index file exists but values file is missing - both files are required")
+		}
+		return nil, fmt.Errorf("values file exists but index file is missing - both files are required")
 	}
-	if !mainFileExists && valuesFileExists {
-		// Remove values file if main file doesn't exist
-		os.Remove(valuesPath)
-		valuesFileExists = false
-	}
-	if !indexFileExists {
-		// Remove WAL file if index file doesn't exist
-		os.Remove(path + "-wal")
-	}
+
+	// If neither file exists and we're not in read-only mode, we'll create them
+	needsInitialization := !indexFileExists && !valuesFileExists
 
 	// Default options
 	lockType := LockExclusive // Default to use an exclusive lock
@@ -344,33 +328,22 @@ func Open(path string, options ...Options) (*DB, error) {
 		}
 	}
 
-	// Open main file with appropriate flags
-	var mainFile *os.File
-	var err error
-	if readOnly {
-		mainFile, err = os.OpenFile(path, os.O_RDONLY, 0666)
-		if err != nil {
-			return nil, fmt.Errorf("failed to open main database file in read-only mode: %w", err)
-		}
-	} else {
-		mainFile, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
-		if err != nil {
-			return nil, fmt.Errorf("failed to open main database file: %w", err)
-		}
+	// If both files are missing and we're in read-only mode, return error
+	if needsInitialization && readOnly {
+		return nil, fmt.Errorf("database files do not exist and cannot be created in read-only mode")
 	}
 
 	// Open index file with appropriate flags
 	var indexFile *os.File
+	var err error
 	if readOnly {
 		indexFile, err = os.OpenFile(indexPath, os.O_RDONLY, 0666)
 		if err != nil {
-			mainFile.Close()
 			return nil, fmt.Errorf("failed to open index database file in read-only mode: %w", err)
 		}
 	} else {
 		indexFile, err = os.OpenFile(indexPath, os.O_RDWR|os.O_CREATE, 0666)
 		if err != nil {
-			mainFile.Close()
 			return nil, fmt.Errorf("failed to open index database file: %w", err)
 		}
 	}
@@ -380,30 +353,20 @@ func Open(path string, options ...Options) (*DB, error) {
 	if readOnly {
 		valuesFile, err = os.OpenFile(valuesPath, os.O_RDONLY, 0666)
 		if err != nil {
-			mainFile.Close()
 			indexFile.Close()
 			return nil, fmt.Errorf("failed to open values file in read-only mode: %w", err)
 		}
 	} else {
 		valuesFile, err = os.OpenFile(valuesPath, os.O_RDWR|os.O_CREATE, 0666)
 		if err != nil {
-			mainFile.Close()
 			indexFile.Close()
 			return nil, fmt.Errorf("failed to open values file: %w", err)
 		}
 	}
 
 	// Get initial file sizes
-	mainFileInfo, err := mainFile.Stat()
-	if err != nil {
-		mainFile.Close()
-		indexFile.Close()
-		return nil, fmt.Errorf("failed to get main file size: %w", err)
-	}
-
 	indexFileInfo, err := indexFile.Stat()
 	if err != nil {
-		mainFile.Close()
 		indexFile.Close()
 		valuesFile.Close()
 		return nil, fmt.Errorf("failed to get index file size: %w", err)
@@ -411,7 +374,6 @@ func Open(path string, options ...Options) (*DB, error) {
 
 	valuesFileInfo, err := valuesFile.Stat()
 	if err != nil {
-		mainFile.Close()
 		indexFile.Close()
 		valuesFile.Close()
 		return nil, fmt.Errorf("failed to get values file size: %w", err)
@@ -420,10 +382,8 @@ func Open(path string, options ...Options) (*DB, error) {
 	db := &DB{
 		databaseID:         0, // Will be set on read or initialize
 		filePath:           path,
-		mainFile:           mainFile,
 		indexFile:          indexFile,
 		valuesFile:         valuesFile,
-		mainFileSize:       mainFileInfo.Size(),
 		indexFileSize:      indexFileInfo.Size(),
 		valuesFileSize:     valuesFileInfo.Size(),
 		readOnly:           readOnly,
@@ -459,72 +419,32 @@ func Open(path string, options ...Options) (*DB, error) {
 	db.updateWriteMode(writeMode)
 	db.nextWriteMode = writeMode
 
-	// Apply file lock if requested
+	// Apply file lock if requested (using index file for locking)
 	if lockType != LockNone {
 		if err := db.Lock(lockType); err != nil {
-			mainFile.Close()
 			indexFile.Close()
+			valuesFile.Close()
 			return nil, fmt.Errorf("failed to lock database files: %w", err)
 		}
 	}
-
-	// Check if we need to initialize the database
-	needsInitialization := !mainFileExists && !readOnly
-
-	// Check if we need to rebuild the index
-	needsIndexInitialization := mainFileExists && (!indexFileExists || indexFileInfo.Size() == 0) && !readOnly
 
 	if needsInitialization {
 		// Initialize new database
 		if err := db.initialize(); err != nil {
 			db.Unlock()
-			mainFile.Close()
 			indexFile.Close()
+			valuesFile.Close()
 			return nil, fmt.Errorf("failed to initialize database: %w", err)
 		}
-	} else if needsIndexInitialization {
-		// Main file exists but index file is missing or empty
-		// Read the main file header first to get the database ID
-		if err := db.readMainFileHeader(); err != nil {
-			db.Unlock()
-			mainFile.Close()
-			indexFile.Close()
-			valuesFile.Close()
-			return nil, fmt.Errorf("failed to read main file header: %w", err)
-		}
-		// Initialize a new index file
-		debugPrint("Index file missing or empty, initializing new index\n")
-		if err := db.initializeIndexFile(); err != nil {
-			db.Unlock()
-			mainFile.Close()
-			indexFile.Close()
-			valuesFile.Close()
-			return nil, fmt.Errorf("failed to initialize index file: %w", err)
-		}
-		debugPrint("Index file rebuilt successfully\n")
 	} else {
 		// Read existing database headers
 		if err := db.readHeader(); err != nil {
 			db.Unlock()
-			mainFile.Close()
 			indexFile.Close()
 			valuesFile.Close()
 			return nil, fmt.Errorf("failed to read database header: %w", err)
 		}
 	}
-
-	// TODO: Implement recovery logic for unindexed content
-	/*
-	if db.lastIndexedOffset < db.mainFileSize {
-		if err := db.recoverUnindexedContent(); err != nil {
-			db.Unlock()
-			mainFile.Close()
-			indexFile.Close()
-			valuesFile.Close()
-			return nil, fmt.Errorf("failed to reindex database: %w", err)
-		}
-	}
-	*/
 
 	// Ensure txnSequence starts at 1
 	db.txnSequence = 1
@@ -659,7 +579,7 @@ func (db *DB) Lock(lockType int) error {
 		return fmt.Errorf("invalid lock type: %d", lockType)
 	}
 
-	err := syscall.Flock(int(db.mainFile.Fd()), lockFlag)
+	err := syscall.Flock(int(db.indexFile.Fd()), lockFlag)
 	if err != nil {
 		if lockType == LockShared {
 			return fmt.Errorf("cannot acquire shared lock (another process may have an exclusive lock): %w", err)
@@ -678,7 +598,7 @@ func (db *DB) Unlock() error {
 		return nil // Not locked
 	}
 
-	err := syscall.Flock(int(db.mainFile.Fd()), syscall.LOCK_UN)
+	err := syscall.Flock(int(db.indexFile.Fd()), syscall.LOCK_UN)
 	if err != nil {
 		return fmt.Errorf("cannot release lock: %w", err)
 	}
@@ -717,10 +637,10 @@ func (db *DB) Close() error {
 	db.mutex.Lock()
 	defer db.mutex.Unlock()
 
-	var mainErr, indexErr, valuesErr, flushErr error
+	var indexErr, valuesErr, flushErr error
 
 	// Check if already closed
-	if db.mainFile == nil && db.indexFile == nil && db.valuesFile == nil {
+	if db.indexFile == nil && db.valuesFile == nil {
 		return nil // Already closed
 	}
 
@@ -750,22 +670,18 @@ func (db *DB) Close() error {
 		}
 	}
 
-	// Close main file if open
-	if db.mainFile != nil {
+	// Close index file if open
+	if db.indexFile != nil {
 		// Release lock if acquired
 		if db.fileLocked {
 			if err := db.Unlock(); err != nil {
-				mainErr = fmt.Errorf("failed to unlock database files: %w", err)
+				indexErr = fmt.Errorf("failed to unlock database files: %w", err)
 			}
 		}
 		// Close the file
-		mainErr = db.mainFile.Close()
-		db.mainFile = nil
-	}
-
-	// Close index file if open
-	if db.indexFile != nil {
-		indexErr = db.indexFile.Close()
+		if err := db.indexFile.Close(); err != nil && indexErr == nil {
+			indexErr = err
+		}
 		db.indexFile = nil
 	}
 
@@ -778,9 +694,6 @@ func (db *DB) Close() error {
 	// Return first error encountered
 	if flushErr != nil {
 		return flushErr
-	}
-	if mainErr != nil {
-		return mainErr
 	}
 	if indexErr != nil {
 		return indexErr
@@ -916,61 +829,6 @@ func (db *DB) set(key, value []byte) error {
 	// Attempt to set the key and value on the empty suffix slot
 	return db.setOnEmptySuffix(radixSubPage, key, value, 0)
 }
-
-/*
-// setKvOnIndex sets an existing key-value pair on the index (reindexing)
-func (db *DB) setKvOnIndex(rootSubPage *RadixSubPage, key, value []byte, valueOffset int64) error {
-
-	// Process the key byte by byte to find where to add it
-	radixSubPage := rootSubPage
-	keyPos := 0
-
-	// Traverse the radix trie until we reach a leaf page or the end of the key
-	for keyPos < len(key) {
-		// Get the current byte from the key
-		byteValue := key[keyPos]
-
-		// Get the next page number and sub-page index from the current sub-page
-		nextPageNumber, nextSubPageIdx := db.getRadixEntry(radixSubPage, byteValue)
-
-		// If there's no entry for this byte, create a new path
-		if nextPageNumber == 0 {
-			// Create a path for this byte
-			return db.createPathForByte(radixSubPage, key, keyPos, valueOffset)
-		}
-
-		// There's an entry for this byte, load the page
-		page, err := db.getPage(nextPageNumber)
-		if err != nil {
-			return fmt.Errorf("failed to load page %d: %w", nextPageNumber, err)
-		}
-
-		// Check what type of page we got
-		if page.pageType == ContentTypeRadix {
-			// It's a radix page, continue traversing
-			radixSubPage = &RadixSubPage{
-				Page:       page,
-				SubPageIdx: nextSubPageIdx,
-			}
-			keyPos++
-		} else if page.pageType == ContentTypeLeaf {
-			// It's a leaf page, get the leaf sub-page
-			leafSubPage := &LeafSubPage{
-				Page:       page,
-				SubPageIdx: nextSubPageIdx,
-			}
-			// Attempt to set the key and value on the leaf sub-page
-			return db.setOnLeafSubPage(radixSubPage, leafSubPage, key, keyPos, value, valueOffset)
-		} else {
-			return fmt.Errorf("invalid page type")
-		}
-	}
-
-	// If we've processed all bytes of the key
-	// Set the content offset on the empty suffix slot
-	return db.setOnEmptySuffix(radixSubPage, key, value, valueOffset)
-}
-*/
 
 // setContentOnIndex sets a suffix + value offset pair on the index
 // it is used when converting a leaf page into a radix page
@@ -1366,11 +1224,6 @@ func (db *DB) initialize() error {
 	originalWriteMode := db.writeMode
 	db.updateWriteMode(WorkerThread_NoWAL_NoSync)
 
-	// Initialize main file
-	if err := db.initializeMainFile(); err != nil {
-		return fmt.Errorf("failed to initialize main file: %w", err)
-	}
-
 	// Initialize index file
 	if err := db.initializeIndexFile(); err != nil {
 		return fmt.Errorf("failed to initialize index file: %w", err)
@@ -1389,33 +1242,7 @@ func (db *DB) initialize() error {
 	return nil
 }
 
-// initializeMainFile initializes the main data file
-func (db *DB) initializeMainFile() error {
-	// Write file header in root page (page 1)
-	rootPage := make([]byte, PageSize)
 
-	// Write the 6-byte magic string
-	copy(rootPage[0:6], MainFileMagicString)
-
-	// Write the 2-byte version
-	copy(rootPage[6:8], VersionString)
-
-	// Write the 8-byte database ID
-	binary.LittleEndian.PutUint64(rootPage[8:16], db.databaseID)
-
-	// The rest of the root page is reserved for future use
-
-	debugPrint("Writing main file root page to disk\n")
-	// Write the root page to the file
-	if _, err := db.mainFile.Write(rootPage); err != nil {
-		return err
-	}
-
-	// Update file size to include the root page
-	db.mainFileSize = PageSize
-
-	return nil
-}
 
 // initializeIndexFile initializes the index file
 func (db *DB) initializeIndexFile() error {
@@ -1495,10 +1322,6 @@ func (db *DB) initializeValuesFile() error {
 
 // readHeader reads the database headers and preloads radix levels
 func (db *DB) readHeader() error {
-	// Read main file header
-	if err := db.readMainFileHeader(); err != nil {
-		return fmt.Errorf("failed to read main file header: %w", err)
-	}
 
 	// Read the index file header directly from the index file
 	if err := db.readIndexFileHeader(false); err != nil {
@@ -1518,8 +1341,8 @@ func (db *DB) readHeader() error {
 		}
 	}
 
-	// Read the index file header from WAL/cache
-	// This will update lastIndexedOffset and freePageNum with the latest values
+	// Read the index file header from WAL/cache for final processing
+	// This will update free page pointers with the latest values
 	if err := db.readIndexFileHeader(true); err != nil {
 		return fmt.Errorf("failed to read index file header from WAL: %w", err)
 	}
@@ -1528,34 +1351,6 @@ func (db *DB) readHeader() error {
 	if err := db.preloadRadixLevels(); err != nil {
 		return fmt.Errorf("failed to preload radix levels: %w", err)
 	}
-
-	return nil
-}
-
-// readMainFileHeader reads the main file header
-func (db *DB) readMainFileHeader() error {
-	// Read the header (16 bytes) in root page (page 1)
-	header := make([]byte, 16)
-	if _, err := db.mainFile.ReadAt(header, 0); err != nil {
-		return err
-	}
-
-	// Extract magic string (6 bytes)
-	fileMagic := string(header[0:6])
-
-	// Extract version (2 bytes)
-	fileVersion := string(header[6:8])
-
-	if fileMagic != MainFileMagicString {
-		return fmt.Errorf("invalid main database file format")
-	}
-
-	if fileVersion != VersionString {
-		return fmt.Errorf("unsupported main database version")
-	}
-
-	// Extract database ID (8 bytes)
-	db.databaseID = binary.LittleEndian.Uint64(header[8:16])
 
 	return nil
 }
@@ -1598,40 +1393,15 @@ func (db *DB) readIndexFileHeader(finalRead bool) error {
 	// Extract database ID (8 bytes)
 	indexDatabaseID := binary.LittleEndian.Uint64(header[8:16])
 
-	// Check if the database ID matches the main file
-	if db.databaseID != 0 && indexDatabaseID != db.databaseID {
-		// Database ID mismatch, delete the index file and recreate it
-		debugPrint("Index file database ID mismatch: %d vs %d, recreating index file\n", indexDatabaseID, db.databaseID)
-
-		// Close the index file
-		if err := db.indexFile.Close(); err != nil {
-			return fmt.Errorf("failed to close index file: %w", err)
-		}
-
-		// Delete the index file
-		if err := os.Remove(db.filePath + "-keys"); err != nil {
-			return fmt.Errorf("failed to delete index file: %w", err)
-		}
-
-		// Reopen the index file
-		db.indexFile, err = os.OpenFile(db.filePath + "-keys", os.O_RDWR|os.O_CREATE, 0666)
-		if err != nil {
-			return fmt.Errorf("failed to reopen index file: %w", err)
-		}
-
-		// Initialize a new index file with the correct database ID
-		return db.initializeIndexFile()
+	// Set the database ID from the index file
+	if db.databaseID == 0 {
+		db.databaseID = indexDatabaseID
+	} else if db.databaseID != indexDatabaseID {
+		return fmt.Errorf("index file database ID mismatch: expected %d, got %d", db.databaseID, indexDatabaseID)
 	}
 
-	// Only process lastIndexedOffset and freePageNum on the final read
+	// Only process free page pointers on the final read
 	if finalRead {
-		// Parse the last indexed offset from the header
-		db.lastIndexedOffset = int64(binary.LittleEndian.Uint64(header[16:24]))
-		if db.lastIndexedOffset == 0 {
-			// If the last indexed offset is 0, default to PageSize
-			db.lastIndexedOffset = PageSize
-		}
-
 		// Parse the free radix pages head pointer
 		freeRadixPageNum := binary.LittleEndian.Uint32(header[24:28])
 
@@ -1680,10 +1450,10 @@ func (db *DB) readValuesFileHeader() error {
 	// Extract database ID (8 bytes)
 	valuesDatabaseID := binary.LittleEndian.Uint64(header[8:16])
 
-	// Check if the database ID matches the main file
+	// Check if the database ID matches the index file
 	if db.databaseID != 0 && valuesDatabaseID != db.databaseID {
-		debugPrint("Values file database ID mismatch: %d vs %d\n", valuesDatabaseID, db.databaseID)
-		return fmt.Errorf("values file database ID mismatch")
+		debugPrint("Values file database ID mismatch: expected %d, got %d\n", db.databaseID, valuesDatabaseID)
+		return fmt.Errorf("values file database ID mismatch: expected %d, got %d", db.databaseID, valuesDatabaseID)
 	}
 
 	// Ensure values file size is at least PageSize to account for header
@@ -1724,11 +1494,7 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 
 	data := headerPage.data
 
-	// Update the header fields
-	lastIndexedOffset := db.flushFileSize
-
-	// Set last indexed offset (8 bytes)
-	binary.LittleEndian.PutUint64(data[16:24], uint64(lastIndexedOffset))
+	// Skip the reserved area (8 bytes at offset 16-24)
 
 	// Set free radix pages head pointer (4 bytes)
 	nextFreeRadixPageNumber := uint32(0)
@@ -1762,9 +1528,6 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 		return fmt.Errorf("failed to write index file header page: %w", err)
 	}
 
-	// Update the in-memory offset
-	db.lastIndexedOffset = lastIndexedOffset
-
 	return nil
 }
 
@@ -1782,8 +1545,7 @@ func (db *DB) initializeIndexHeader() error {
 	// Write the 8-byte database ID
 	binary.LittleEndian.PutUint64(data[8:16], db.databaseID)
 
-	// Set initial last indexed offset (8 bytes)
-	binary.LittleEndian.PutUint64(data[16:24], uint64(PageSize))
+	// Reserve 8 bytes (16-24) for future use
 
 	// Set free radix pages head pointer (4 bytes)
 	binary.LittleEndian.PutUint32(data[24:28], 0)
@@ -1818,9 +1580,6 @@ func (db *DB) initializeIndexHeader() error {
 	if err := db.writeIndexPage(headerPage); err != nil {
 		return fmt.Errorf("failed to write initial index file header page: %w", err)
 	}
-
-	// Set the last indexed offset
-	db.lastIndexedOffset = PageSize
 
 	return nil
 }
@@ -2638,14 +2397,14 @@ func (db *DB) Sync() error {
 		return fmt.Errorf("failed to flush index to disk: %w", err)
 	}
 
-	// Sync the main file
-	if err := db.mainFile.Sync(); err != nil {
-		return fmt.Errorf("failed to sync main file: %w", err)
-	}
-
 	// Sync the index file
 	if err := db.indexFile.Sync(); err != nil {
 		return fmt.Errorf("failed to sync index file: %w", err)
+	}
+
+	// Sync the values file
+	if err := db.valuesFile.Sync(); err != nil {
+		return fmt.Errorf("failed to sync values file: %w", err)
 	}
 
 	return nil
@@ -2653,13 +2412,6 @@ func (db *DB) Sync() error {
 
 // RefreshFileSize updates the cached file sizes from the actual files
 func (db *DB) RefreshFileSize() error {
-	// Refresh main file size
-	mainFileInfo, err := db.mainFile.Stat()
-	if err != nil {
-		return fmt.Errorf("failed to get main file size: %w", err)
-	}
-	db.mainFileSize = mainFileInfo.Size()
-
 	// Refresh index file size
 	indexFileInfo, err := db.indexFile.Stat()
 	if err != nil {
@@ -2816,12 +2568,6 @@ func (db *DB) beginTransaction() {
 	// Increment the transaction sequence number (to track the pages used in the transaction)
 	db.txnSequence++
 
-	// Store the current main file size to enable rollback (to truncate the main file)
-	db.prevFileSize = db.mainFileSize
-
-	// Reset the transaction checksum
-	db.txnChecksum = 0
-
 	db.seqMutex.Unlock()
 
 
@@ -2858,15 +2604,6 @@ func (db *DB) commitTransaction() {
 	debugPrint("Committing transaction %d\n", db.txnSequence)
 
 	// TODO: Implement commit marker
-	/*
-	// Write commit marker to the main file if data was written in this transaction
-	if !db.readOnly && db.mainFileSize > db.prevFileSize {
-		if err := db.appendCommitMarker(); err != nil {
-			debugPrint("Failed to write commit marker: %v\n", err)
-			// Continue with commit even if marker fails
-		}
-	}
-	*/
 
 	// Release transaction lock if it was acquired for this transaction
 	if db.lockAcquiredForTransaction {
@@ -2890,6 +2627,8 @@ func (db *DB) commitTransaction() {
 func (db *DB) rollbackTransaction() {
 	debugPrint("Rolling back transaction %d\n", db.txnSequence)
 
+	// TODO: Implement truncation of index and values files
+	/*
 	// Truncate the main db file to the stored size before the transaction started
 	if db.mainFileSize > db.prevFileSize {
 		err := db.mainFile.Truncate(db.prevFileSize)
@@ -2901,6 +2640,7 @@ func (db *DB) rollbackTransaction() {
 		// Update the in-memory file size
 		db.mainFileSize = db.prevFileSize
 	}
+	*/
 
 	// Discard pages from this transaction (they should be reloaded from the index file)
 	db.discardNewerPages(db.txnSequence)
@@ -3638,16 +3378,11 @@ func (db *DB) flushIndexToDisk() error {
 	}
 
 	db.seqMutex.Lock()
-	// Set flush sequence number limit and determine the appropriate main file size for this flush
+	// Set flush sequence number limit
 	if db.inTransaction {
 		db.flushSequence = db.txnSequence - 1
-		// For worker thread flushes during transactions, use the file size from before the current transaction
-		// This ensures we only index content that has been committed
-		db.flushFileSize = db.prevFileSize
 	} else {
 		db.flushSequence = db.txnSequence
-		// When not in transaction, use current main file size
-		db.flushFileSize = db.mainFileSize
 	}
 	db.seqMutex.Unlock()
 
