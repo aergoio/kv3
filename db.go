@@ -1094,7 +1094,7 @@ func (db *DB) setOnLeafSubPage(parentSubPage *RadixSubPage, subPage *LeafSubPage
 		// If we're setting a new key-value pair
 		if valueOffset == 0 {
 			// Read the value from the value file
-			existingValue, err = db.readValue(existingValueOffset)
+			existingValue, err = db.readValue(existingValueOffset, db.txnSequence)
 			if err != nil {
 				return fmt.Errorf("failed to read value: %w", err)
 			}
@@ -1182,7 +1182,7 @@ func (db *DB) setOnEmptySuffix(subPage *RadixSubPage, key, value []byte, valueOf
 		// If we're setting a new key-value pair
 		if valueOffset == 0 {
 			// Read the value at the offset
-			existingValue, err = db.readValue(emptySuffixOffset)
+			existingValue, err = db.readValue(emptySuffixOffset, db.txnSequence)
 			if err != nil {
 				return fmt.Errorf("failed to read value: %w", err)
 			}

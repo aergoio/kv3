@@ -2002,7 +2002,7 @@ func TestSetOnLeafSubPage(t *testing.T) {
 		}
 
 		// Verify data can be read back
-		readValue, err := db.readValue(dataOffset)
+		readValue, err := db.readValue(dataOffset, db.txnSequence)
 		if err != nil {
 			t.Fatalf("Failed to read value: %v", err)
 		}
@@ -2050,7 +2050,7 @@ func TestSetOnLeafSubPage(t *testing.T) {
 		if !found {
 			t.Fatalf("Expected to find entry at index 0")
 		}
-		originalReadValue, err := db.readValue(originalDataOffset)
+		originalReadValue, err := db.readValue(originalDataOffset, db.txnSequence)
 		if err != nil {
 			t.Fatalf("Failed to read original value: %v", err)
 		}
@@ -2075,7 +2075,7 @@ func TestSetOnLeafSubPage(t *testing.T) {
 		if !found {
 			t.Fatalf("Expected to find entry at index 0")
 		}
-		updatedReadValue, err := db.readValue(updatedDataOffset)
+		updatedReadValue, err := db.readValue(updatedDataOffset, db.txnSequence)
 		if err != nil {
 			t.Fatalf("Failed to read updated value: %v", err)
 		}
@@ -2226,7 +2226,7 @@ func TestSetOnLeafSubPage(t *testing.T) {
 		if !found {
 			t.Fatalf("Expected to find entry at index 0")
 		}
-		content, err := db.readValue(firstDataOffset)
+		content, err := db.readValue(firstDataOffset, db.txnSequence)
 		if err != nil {
 			t.Fatalf("Failed to read updated content: %v", err)
 		}
@@ -2240,7 +2240,7 @@ func TestSetOnLeafSubPage(t *testing.T) {
 			if !found {
 				t.Fatalf("Expected to find entry at index %d", i)
 			}
-			content, err := db.readValue(dataOffset)
+			content, err := db.readValue(dataOffset, db.txnSequence)
 			if err != nil {
 				t.Fatalf("Failed to read content for entry %d: %v", i, err)
 			}
@@ -2316,7 +2316,7 @@ func TestSetOnLeafSubPage(t *testing.T) {
 		if !found {
 			t.Fatalf("Expected to find entry at index 1")
 		}
-		content, err := db.readValue(middleDataOffset)
+		content, err := db.readValue(middleDataOffset, db.txnSequence)
 		if err != nil {
 			t.Fatalf("Failed to read updated content: %v", err)
 		}
@@ -2330,7 +2330,7 @@ func TestSetOnLeafSubPage(t *testing.T) {
 			if !found {
 				t.Fatalf("Expected to find entry at index %d", idx)
 			}
-			content, err := db.readValue(dataOffset)
+			content, err := db.readValue(dataOffset, db.txnSequence)
 			if err != nil {
 				t.Fatalf("Failed to read content for entry %d: %v", idx, err)
 			}
@@ -2407,7 +2407,7 @@ func TestSetOnLeafSubPage(t *testing.T) {
 		if !found {
 			t.Fatalf("Expected to find entry at index 2")
 		}
-		content, err := db.readValue(lastEntryDataOffset)
+		content, err := db.readValue(lastEntryDataOffset, db.txnSequence)
 		if err != nil {
 			t.Fatalf("Failed to read updated content: %v", err)
 		}
@@ -2421,7 +2421,7 @@ func TestSetOnLeafSubPage(t *testing.T) {
 			if !found {
 				t.Fatalf("Expected to find entry at index %d", i)
 			}
-			content, err := db.readValue(dataOffset)
+			content, err := db.readValue(dataOffset, db.txnSequence)
 			if err != nil {
 				t.Fatalf("Failed to read content for entry %d: %v", i, err)
 			}
@@ -2504,7 +2504,7 @@ func TestSetOnLeafSubPage(t *testing.T) {
 			if !found {
 				t.Fatalf("Expected to find entry at index %d", i)
 			}
-			content, err := db.readValue(dataOffset)
+			content, err := db.readValue(dataOffset, db.txnSequence)
 			if err != nil {
 				t.Fatalf("Failed to read content for remaining entry %d: %v", i, err)
 			}
@@ -2589,7 +2589,7 @@ func TestSetOnLeafSubPage(t *testing.T) {
 			if !found {
 				t.Fatalf("Expected to find entry at index %d", i)
 			}
-			content, err := db.readValue(dataOffset)
+			content, err := db.readValue(dataOffset, db.txnSequence)
 			if err != nil {
 				t.Fatalf("Failed to read content for remaining entry %d: %v", i, err)
 			}
@@ -2665,7 +2665,7 @@ func TestSetOnLeafSubPage(t *testing.T) {
 			if !found {
 				t.Fatalf("Expected to find entry at index %d", i)
 			}
-			content, err := db.readValue(dataOffset)
+			content, err := db.readValue(dataOffset, db.txnSequence)
 			if err != nil {
 				t.Fatalf("Failed to read content for remaining entry %d: %v", i, err)
 			}
@@ -2721,7 +2721,7 @@ func TestSetOnLeafSubPage(t *testing.T) {
 		newEntryDataOffset := dataOffset
 
 		// Verify data can be read back
-		content, err := db.readValue(newEntryDataOffset)
+		content, err := db.readValue(newEntryDataOffset, db.txnSequence)
 		if err != nil {
 			t.Fatalf("Failed to read content: %v", err)
 		}
@@ -5080,7 +5080,7 @@ func TestEmptySuffixOnRadixPages(t *testing.T) {
 		}
 
 		// Verify we can read the content back
-		content, err := db.readValue(offset)
+		content, err := db.readValue(offset, db.txnSequence)
 		if err != nil {
 			t.Fatalf("Failed to read content: %v", err)
 		}
@@ -5122,7 +5122,7 @@ func TestEmptySuffixOnRadixPages(t *testing.T) {
 		}
 
 		// Verify the updated content
-		content, err := db.readValue(updatedOffset)
+		content, err := db.readValue(updatedOffset, db.txnSequence)
 		if err != nil {
 			t.Fatalf("Failed to read updated content: %v", err)
 		}
