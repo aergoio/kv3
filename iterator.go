@@ -227,12 +227,13 @@ func (it *Iterator) processEmptySuffix(subPage *RadixSubPage) bool {
 	// Process the empty suffix
 	emptySuffixOffset := it.db.getEmptySuffixOffset(subPage)
 	if emptySuffixOffset > 0 {
-		// Read the content at the offset
-		content, err := it.db.readContent(emptySuffixOffset)
+		// Read the value at the offset
+		value, err := it.db.readValue(emptySuffixOffset)
 		if err == nil {
-			// Found a valid entry
-			it.currentKey = content.key
-			it.currentValue = content.value
+			// Found a valid entry - empty suffix means the key is the path we've traveled
+			it.currentKey = make([]byte, len(it.keyPrefix))
+			copy(it.currentKey, it.keyPrefix)
+			it.currentValue = value
 			it.valid = true
 
 			return true
@@ -331,17 +332,18 @@ func (it *Iterator) processLeafPage(pos *radixIterPos) bool {
 	// Get the current entry
 	entry := it.leafEntries[it.leafIdx]
 
-	// Read the content at the offset to get the value
-	content, err := it.db.readContent(entry.dataOffset)
+	// Read the value at the offset to get the value
+	value, err := it.db.readValue(entry.dataOffset)
 	if err != nil {
-		// If we can't read the content, move to the next entry
+		// If we can't read the value, move to the next entry
 		//it.leafIdx++
 		return it.processLeafPage(pos)
 	}
 
 	// Set current key and value
-	it.currentKey = content.key
-	it.currentValue = content.value
+	it.currentKey = make([]byte, len(entry.key))
+	copy(it.currentKey, entry.key)
+	it.currentValue = value
 	it.valid = true
 	return true
 }

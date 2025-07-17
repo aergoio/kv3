@@ -8,16 +8,25 @@ import (
 	"os"
 	"sort"
 	"time"
+
+	"github.com/aergoio/kv_log/varint"
 )
 
 // WAL constants
 const (
 	// WAL magic string for identification
-	WalMagicString = "KV_WAL"
+	WalMagicString = "KV3WAL"
 	// WAL header size
 	WalHeaderSize = 28
 	// WAL frame header size
-	WalFrameHeaderSize = 20
+	WalFrameHeaderSize = 25
+)
+
+// WAL frame types
+const (
+	WalFrameTypePage   = 'P' // Page frame (index file)
+	WalFrameTypeValue  = 'V' // Value frame (values file)
+	WalFrameTypeCommit = 'C' // Commit frame
 )
 
 // WalInfo represents the WAL file information
@@ -121,14 +130,11 @@ func (db *DB) writeToWAL(pageData []byte, pageNumber uint32) error {
 		}
 	}
 
-	// Write the frame to the WAL file
-	err := db.writeFrame(pageNumber, pageData)
+	// Write the page frame to the WAL file
+	err := db.writePageFrame(pageNumber, pageData)
 	if err != nil {
 		return err
 	}
-
-	// Add the page to the in-memory WAL cache
-	//db.addToWalCache(pageNumber, pageData, db.txnSequence)
 
 	return nil
 }
@@ -215,7 +221,7 @@ func (db *DB) createWAL() error {
 }
 
 // writeFrameHeader writes a frame header to the WAL file
-func (db *DB) writeFrameHeader(pageNumber uint32, commitFlag int, data []byte) (int64, error) {
+func (db *DB) writeFrameHeader(frameType byte, identifier uint32, offset int64, data []byte) (int64, error) {
 
 	// Use the nextWritePosition instead of getting the file size
 	frameOffset := db.walInfo.nextWritePosition
@@ -223,24 +229,27 @@ func (db *DB) writeFrameHeader(pageNumber uint32, commitFlag int, data []byte) (
 	// Create frame header buffer
 	frameHeader := make([]byte, WalFrameHeaderSize)
 
-	// Write page number
-	binary.BigEndian.PutUint32(frameHeader[0:4], pageNumber)
+	// Write frame type
+	frameHeader[0] = frameType
 
-	// Write commit flag (1 for commit records, 0 for normal frames)
-	binary.BigEndian.PutUint32(frameHeader[4:8], uint32(commitFlag))
+	// Write identifier (page number for pages, unused for values and commits)
+	binary.BigEndian.PutUint32(frameHeader[1:5], identifier)
+
+	// Write offset (for values) or zero (for pages and commits)
+	binary.BigEndian.PutUint64(frameHeader[5:13], uint64(offset))
 
 	// Write salts
-	binary.BigEndian.PutUint32(frameHeader[8:12], db.walInfo.salt1)
-	binary.BigEndian.PutUint32(frameHeader[12:16], db.walInfo.salt2)
+	binary.BigEndian.PutUint32(frameHeader[13:17], db.walInfo.salt1)
+	binary.BigEndian.PutUint32(frameHeader[17:21], db.walInfo.salt2)
 
 	// Calculate cumulative checksum
 	// Start with the current checksum value
 	checksum := db.walInfo.checksum
 
-	// Update checksum with first 12 bytes of frame header (page number and commit flag)
-	checksum = crc32.Update(checksum, db.walInfo.hasher, frameHeader[0:8])
+	// Update checksum with first 13 bytes of frame header (type, identifier, offset)
+	checksum = crc32.Update(checksum, db.walInfo.hasher, frameHeader[0:13])
 
-	// Update checksum with page data if provided
+	// Update checksum with data if provided
 	if data != nil {
 		checksum = crc32.Update(checksum, db.walInfo.hasher, data)
 	}
@@ -249,7 +258,7 @@ func (db *DB) writeFrameHeader(pageNumber uint32, commitFlag int, data []byte) (
 	db.walInfo.checksum = checksum
 
 	// Write the checksum to the frame header
-	binary.BigEndian.PutUint32(frameHeader[16:20], checksum)
+	binary.BigEndian.PutUint32(frameHeader[21:25], checksum)
 
 	// Write frame header to WAL file
 	if _, err := db.walInfo.file.WriteAt(frameHeader, frameOffset); err != nil {
@@ -259,23 +268,92 @@ func (db *DB) writeFrameHeader(pageNumber uint32, commitFlag int, data []byte) (
 	return frameOffset, nil
 }
 
-// writeFrame writes a frame to the WAL file
-func (db *DB) writeFrame(pageNumber uint32, pageData []byte) error {
+// writePageFrame writes a page frame to the WAL file
+func (db *DB) writePageFrame(pageNumber uint32, pageData []byte) error {
 	// Write the frame header
-	frameOffset, err := db.writeFrameHeader(pageNumber, 0, pageData)
+	frameOffset, err := db.writeFrameHeader(WalFrameTypePage, pageNumber, 0, pageData)
 	if err != nil {
 		return err
 	}
 
 	// Write page data after the header
 	if _, err := db.walInfo.file.WriteAt(pageData, frameOffset+WalFrameHeaderSize); err != nil {
-		return fmt.Errorf("failed to write WAL frame data: %w", err)
+		return fmt.Errorf("failed to write WAL page frame data: %w", err)
 	}
 
 	// Update the nextWritePosition for the next frame
 	db.walInfo.nextWritePosition = frameOffset + WalFrameHeaderSize + int64(len(pageData))
 
 	return nil
+}
+
+// writeValueFrame writes a value frame to the WAL file
+func (db *DB) writeValueFrame(offset int64, value []byte) error {
+	// Prepare the value data with type, size, and value
+	valueData := prepareValueData(value)
+
+	// Write the frame header with the total segment size in the identifier field
+	frameOffset, err := db.writeFrameHeader(WalFrameTypeValue, uint32(len(valueData)), offset, valueData)
+	if err != nil {
+		return err
+	}
+
+	// Write value data after the header
+	if _, err := db.walInfo.file.WriteAt(valueData, frameOffset+WalFrameHeaderSize); err != nil {
+		return fmt.Errorf("failed to write WAL value frame data: %w", err)
+	}
+
+	// Update the nextWritePosition for the next frame
+	db.walInfo.nextWritePosition = frameOffset + WalFrameHeaderSize + int64(len(valueData))
+
+	return nil
+}
+
+// writeValueToWAL writes a value to the WAL file
+func (db *DB) writeValueToWAL(offset int64, value []byte) error {
+	// Check if we're in WAL mode
+	if !db.useWAL {
+		return nil
+	}
+	// Open or create the WAL file if it doesn't exist
+	if db.walInfo == nil {
+		err := db.openWAL()
+		if err != nil {
+			return err
+		}
+	}
+
+	// Write the value frame to the WAL file
+	err := db.writeValueFrame(offset, value)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// prepareValueData creates a properly formatted value data buffer with type, size, and value
+func prepareValueData(value []byte) []byte {
+	// If the value is nil, mark it as deleted
+	if value == nil {
+		return []byte{'F'}
+	}
+
+	// Calculate the exact size needed for the value data
+	varintSize := varint.Size(uint64(len(value)))
+	totalSize := 1 + varintSize + len(value) // 1 for type, varint size, value size
+
+	// Create the complete value data: type + size + value
+	valueData := make([]byte, totalSize)
+	valueData[0] = 'V' // Type
+
+	// Write size as varint directly into the buffer
+	varint.Write(valueData[1:], uint64(len(value)))
+
+	// Copy value data
+	copy(valueData[1+varintSize:], value)
+
+	return valueData
 }
 
 // scanWAL loads valid frames from the WAL file and populates the in-memory cache
@@ -351,28 +429,27 @@ func (db *DB) scanWAL() error {
 			break
 		}
 
+		// Extract frame type
+		frameType := frameHeader[0]
+
 		// Verify salt values match the header
-		frameSalt1 := binary.BigEndian.Uint32(frameHeader[8:12])
-		frameSalt2 := binary.BigEndian.Uint32(frameHeader[12:16])
+		frameSalt1 := binary.BigEndian.Uint32(frameHeader[13:17])
+		frameSalt2 := binary.BigEndian.Uint32(frameHeader[17:21])
 		if frameSalt1 != db.walInfo.salt1 || frameSalt2 != db.walInfo.salt2 {
 			// Salt mismatch, stop scanning
 			break
 		}
 
-		// Check if this is a commit record (commit flag = 1)
-		commitFlag := binary.BigEndian.Uint32(frameHeader[4:8])
-		isCommit := commitFlag == 1
-
 		// Extract the frame checksum
-		frameChecksum := binary.BigEndian.Uint32(frameHeader[16:20])
+		frameChecksum := binary.BigEndian.Uint32(frameHeader[21:25])
 
 		// Calculate expected checksum
-		// Update running checksum with first 12 bytes of frame header (page number and commit flag)
-		runningChecksum = crc32.Update(runningChecksum, db.walInfo.hasher, frameHeader[0:8])
+		// Update running checksum with first 13 bytes of frame header (type, identifier, offset)
+		runningChecksum = crc32.Update(runningChecksum, db.walInfo.hasher, frameHeader[0:13])
 
-		if isCommit {
+		if frameType == WalFrameTypeCommit {
 			// This is a commit record, update lastCommitOffset
-			// Commit records have no page data, just the header
+			// Commit records have no data, just the header
 
 			// Verify checksum
 			if frameChecksum != runningChecksum {
@@ -390,8 +467,9 @@ func (db *DB) scanWAL() error {
 			localCache.discardOldPageVersions()
 
 			if !db.readOnly {
-				// Copy these pages to the index file
+				// Copy these pages and values to the files
 				db.copyPagesToIndexFile(localCache, commitSequence)
+				db.copyValuesToValuesFile(commitSequence)
 			}
 
 			// Increment the commit sequence number
@@ -402,41 +480,113 @@ func (db *DB) scanWAL() error {
 			continue
 		}
 
-		// This is a regular frame with page data
-		// Ensure we don't read past the end of the file
-		pageSize := int64(PageSize)
-		if offset+WalFrameHeaderSize+pageSize > walFileInfo.Size() {
+		if frameType == WalFrameTypePage {
+			// This is a page frame
+			// Ensure we don't read past the end of the file
+			pageSize := int64(PageSize)
+			if offset+WalFrameHeaderSize+pageSize > walFileInfo.Size() {
+				break
+			}
+
+			// Extract page number from frame header
+			pageNumber := binary.BigEndian.Uint32(frameHeader[1:5])
+
+			// Read the page data
+			pageData := make([]byte, pageSize)
+			if _, err := db.walInfo.file.ReadAt(pageData, offset+WalFrameHeaderSize); err != nil {
+				// Error reading page data, stop scanning
+				break
+			}
+
+			// Update running checksum with page data
+			runningChecksum = crc32.Update(runningChecksum, db.walInfo.hasher, pageData)
+
+			// Verify checksum
+			if frameChecksum != runningChecksum {
+				// Checksum mismatch, stop scanning
+				break
+			}
+
+			// Add the page directly to the in-memory cache
+			localCache.add(pageNumber, pageData, commitSequence)
+
+			// Move to the next frame
+			offset += WalFrameHeaderSize + pageSize
+
+		} else if frameType == WalFrameTypeValue {
+			// This is a value frame
+			// Extract the value offset from frame header
+			valueOffset := int64(binary.BigEndian.Uint64(frameHeader[5:13]))
+
+			// Extract the total segment size from the identifier field
+			segmentSize := int(binary.BigEndian.Uint32(frameHeader[1:5]))
+
+			// Ensure we don't read past the end of the file
+			if offset+WalFrameHeaderSize+int64(segmentSize) > walFileInfo.Size() {
+				break
+			}
+
+			// Read the complete value data
+			segment := make([]byte, segmentSize)
+			if _, err := db.walInfo.file.ReadAt(segment, offset+WalFrameHeaderSize); err != nil {
+				break
+			}
+
+			// Update running checksum with value data
+			runningChecksum = crc32.Update(runningChecksum, db.walInfo.hasher, segment)
+
+			// Verify checksum
+			if frameChecksum != runningChecksum {
+				// Checksum mismatch, stop scanning
+				break
+			}
+
+			// Get the value type
+			valueType := segment[0]
+
+			// Extract the actual value based on type
+			var actualValue []byte
+			if valueType == 'F' {
+				// Deleted value - store as nil
+				actualValue = nil
+			} else if valueType == 'V' {
+				// Parse the actual value from the value data (skip type and size varint)
+				if segmentSize < 2 {
+					// Invalid value data size
+					break
+				}
+				// Parse the size varint to find where the actual value starts
+				valueSize64, bytesRead := varint.Read(segment[1:])
+				if bytesRead == 0 || 1+bytesRead+int(valueSize64) != segmentSize {
+					// Invalid value data format
+					break
+				}
+				// Normal value - extract the data (skip type and size)
+				actualValue = segment[1+bytesRead:]
+			} else {
+				// Unknown value type, skip this frame
+				break
+			}
+
+			// Add the value to the value cache with versioning
+			db.valueCacheMutex.Lock()
+			existingEntry := db.valueCache[valueOffset]
+			newEntry := &ValueEntry{
+				value:       actualValue,
+				txnSequence: commitSequence,
+				isWAL:       true,
+				next:        existingEntry, // Link to previous version
+			}
+			db.valueCache[valueOffset] = newEntry
+			db.valueCacheMutex.Unlock()
+
+			// Move to the next frame
+			offset += WalFrameHeaderSize + int64(segmentSize)
+
+		} else {
+			// Unknown frame type, stop scanning
 			break
 		}
-
-		// Extract page number from frame header
-		pageNumber := binary.BigEndian.Uint32(frameHeader[0:4])
-
-		// Read the page data
-		pageData := make([]byte, pageSize)
-		if _, err := db.walInfo.file.ReadAt(pageData, offset+WalFrameHeaderSize); err != nil {
-			// Error reading page data, stop scanning
-			break
-		}
-
-		// Update running checksum with page data
-		runningChecksum = crc32.Update(runningChecksum, db.walInfo.hasher, pageData)
-
-		// Verify checksum
-		if frameChecksum != runningChecksum {
-			// Checksum mismatch, stop scanning
-			break
-		}
-
-		// For pages from the current transaction, we need to handle them specially
-		// If we already have this page in the cache from the current transaction, the new version should replace it
-		// If we have this page only from a previous transaction, we should add the new version
-
-		// Add the page directly to the in-memory cache
-		localCache.add(pageNumber, pageData, commitSequence)
-
-		// Move to the next frame
-		offset += WalFrameHeaderSize + pageSize
 	}
 
 	// If the last scanned position is beyond the last commit position, there were frames without a commit
@@ -497,13 +647,13 @@ func (db *DB) walCommit() error {
 		return nil
 	}
 
-	// Write a commit record - just a header with commit flag set to 1 and no page data
-	frameOffset, err := db.writeFrameHeader(0, 1, nil)
+	// Write a commit record - just a header with no data
+	frameOffset, err := db.writeFrameHeader(WalFrameTypeCommit, 0, 0, nil)
 	if err != nil {
 		return err
 	}
 
-	// Update the next write position (only header, no page data for commit records)
+	// Update the next write position (only header, no data for commit records)
 	db.walInfo.nextWritePosition = frameOffset + WalFrameHeaderSize
 
 	// Update the lastCommitPosition to the current nextWritePosition
@@ -522,6 +672,8 @@ func (db *DB) walCommit() error {
 
 	// Clean up old page versions from cache after successful commit
 	db.discardOldPageVersions(true)
+	// Discard previous versions of values
+	db.discardOldValueVersions(true)
 
 	// Update sequence number after successful commit
 	db.walInfo.lastCommitSequence = db.txnSequence
@@ -538,6 +690,7 @@ func (db *DB) walCommit() error {
 	return nil
 }
 
+/*
 // walRollback rolls back the current transaction
 func (db *DB) walRollback() error {
 	if db.walInfo == nil {
@@ -556,11 +709,15 @@ func (db *DB) walRollback() error {
 	// Remove pages that are from the current transaction from the cache
 	db.discardNewerPages(currentSeq)
 
+	// Remove values that are from the current transaction from the value cache
+	db.rollbackValueCache(currentSeq)
+
 	// Keep the same sequence number for the next transaction attempt
 	// This is important to maintain consistency
 
 	return nil
 }
+*/
 
 // shouldCheckpoint checks if the WAL file should be checkpointed
 func (db *DB) shouldCheckpoint() bool {
@@ -595,8 +752,8 @@ func (db *DB) checkpointWAL() error {
 	// Get the start sequence number for the checkpoint
 	//startSequence := db.walInfo.lastCheckpointSequence
 
-	// Copy WAL pages to the index file
-	if err := db.copyWALPagesToIndexFile(); err != nil {
+	// Copy WAL content to the keys file and values file
+	if err := db.copyWALContentToDbFiles(); err != nil {
 		return fmt.Errorf("failed to copy pages to index file: %w", err)
 	}
 
@@ -611,6 +768,8 @@ func (db *DB) checkpointWAL() error {
 	// Clear the page cache
 	// Clear the isWAL flag for all pages and remove older versions
 	db.discardOldPageVersions(false)
+	// Discard previous versions of values
+	db.discardOldValueVersions(false)
 
 	// Reset the WAL file
 	return db.resetWAL()
@@ -652,10 +811,88 @@ func (db *DB) copyPagesToIndexFile(localCache localCache, commitSequence int64) 
 		}
 
 		// Ensure the index file size is updated if necessary
-		requiredSize := offset + PageSize
-		if requiredSize > db.indexFileSize {
-			db.indexFileSize = requiredSize
+		finalOffset := offset + PageSize
+		if finalOffset > db.indexFileSize {
+			db.indexFileSize = finalOffset
 		}
+	}
+
+	return nil
+}
+
+// copyValuesToValuesFile copies values from the value cache to the values file
+func (db *DB) copyValuesToValuesFile(commitSequence int64) error {
+	if db.walInfo == nil {
+		return nil
+	}
+
+	// Get all values with the specified commit sequence
+	db.valueCacheMutex.RLock()
+	var offsets []int64
+	for offset, entry := range db.valueCache {
+		// Find the version with the specified commit sequence
+		for ; entry != nil; entry = entry.next {
+			if entry.txnSequence == commitSequence {
+				offsets = append(offsets, offset)
+				break
+			}
+		}
+	}
+	db.valueCacheMutex.RUnlock()
+
+	// Sort offsets for sequential access
+	sort.Slice(offsets, func(i, j int) bool {
+		return offsets[i] < offsets[j]
+	})
+
+	// Copy values to the values file in sorted order
+	for _, offset := range offsets {
+		db.valueCacheMutex.RLock()
+		entry := db.valueCache[offset]
+		// Find the version with the specified commit sequence
+		for ; entry != nil; entry = entry.next {
+			if entry.txnSequence == commitSequence {
+				break
+			}
+		}
+		db.valueCacheMutex.RUnlock()
+
+		if entry == nil {
+			continue // Entry not found for this commit sequence
+		}
+
+		// Prepare the value data with type, size, and value
+		valueData := prepareValueData(entry.value)
+
+		// Write the value data to the values file
+		if _, err := db.valuesFile.WriteAt(valueData, offset); err != nil {
+			return fmt.Errorf("failed to write value at offset %d to values file: %w", offset, err)
+		}
+
+		// Update values file size if necessary (only if we're extending the file)
+		finalOffset := offset + int64(len(valueData))
+		if finalOffset > db.valuesFileSize {
+			db.valuesFileSize = finalOffset
+		}
+	}
+
+	return nil
+}
+
+// copyWALContentToDbFiles copies pages from the WAL cache to the index file and values to the values file
+func (db *DB) copyWALContentToDbFiles() error {
+	if db.walInfo == nil {
+		return nil
+	}
+
+	// Copy values to the values file
+	if err := db.copyWALValuesToValuesFile(); err != nil {
+		return fmt.Errorf("failed to copy values to values file: %w", err)
+	}
+
+	// Copy pages to the index file
+	if err := db.copyWALPagesToIndexFile(); err != nil {
+		return fmt.Errorf("failed to copy pages to index file: %w", err)
 	}
 
 	return nil
@@ -663,11 +900,8 @@ func (db *DB) copyPagesToIndexFile(localCache localCache, commitSequence int64) 
 
 // copyWALPagesToIndexFile copies pages from the WAL cache to the index file
 func (db *DB) copyWALPagesToIndexFile() error {
-	if db.walInfo == nil {
-		return nil
-	}
 
-	// Get the list of page numbers to copy
+	// Copy pages
 	var pageNumbers []uint32
 
 	for bucketIdx := 0; bucketIdx < 1024; bucketIdx++ {
@@ -719,6 +953,56 @@ func (db *DB) copyWALPagesToIndexFile() error {
 		// Write the page data to the index file
 		if _, err := db.indexFile.WriteAt(walPage.data, offset); err != nil {
 			return fmt.Errorf("failed to write page %d to index file: %w", pageNumber, err)
+		}
+	}
+
+	return nil
+}
+
+// copyWALValuesToValuesFile copies values from the WAL cache to the values file
+func (db *DB) copyWALValuesToValuesFile() error {
+
+	// Copy values
+	var valueOffsets []int64
+	db.valueCacheMutex.RLock()
+	for offset, entry := range db.valueCache {
+		// Find the first WAL version
+		for ; entry != nil; entry = entry.next {
+			if entry.isWAL {
+				valueOffsets = append(valueOffsets, offset)
+				break
+			}
+		}
+	}
+	db.valueCacheMutex.RUnlock()
+
+	// Sort value offsets for sequential access
+	sort.Slice(valueOffsets, func(i, j int) bool {
+		return valueOffsets[i] < valueOffsets[j]
+	})
+
+	// Copy values to the values file in sorted order
+	for _, offset := range valueOffsets {
+		db.valueCacheMutex.RLock()
+		entry := db.valueCache[offset]
+		// Find the first WAL version
+		for ; entry != nil; entry = entry.next {
+			if entry.isWAL {
+				break
+			}
+		}
+		db.valueCacheMutex.RUnlock()
+
+		if entry == nil {
+			continue // No WAL entry found
+		}
+
+		// Prepare the value data with type, size, and value
+		valueData := prepareValueData(entry.value)
+
+		// Write the value data to the values file
+		if _, err := db.valuesFile.WriteAt(valueData, offset); err != nil {
+			return fmt.Errorf("failed to write value at offset %d to values file: %w", offset, err)
 		}
 	}
 

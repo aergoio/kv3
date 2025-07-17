@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
-	"io"
+	//"io"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -25,8 +25,9 @@ const (
 	// Page size (4KB)
 	PageSize = 4096
 	// Magic strings for database identification (6 bytes)
-	MainFileMagicString  string = "KV_LOG"
-	IndexFileMagicString string = "KV_IDX"
+	MainFileMagicString   string = "KV3LOG"
+	IndexFileMagicString  string = "KV3KEY"
+	ValuesFileMagicString string = "KV3VAL"
 	// Database version (2 bytes as a string)
 	VersionString string = "\x00\x01"
 	// Maximum key length
@@ -102,6 +103,14 @@ type FreeSpaceEntry struct {
 	FreeSpace  uint16 // Amount of free space in bytes
 }
 
+// ValueEntry represents a value entry in the value cache
+type ValueEntry struct {
+	value       []byte      // The value data
+	txnSequence int64       // Transaction sequence number when this value was written
+	isWAL       bool        // Whether this value is part of the WAL
+	next        *ValueEntry // Pointer to the next entry with the same offset (for versioning)
+}
+
 // cacheBucket represents a bucket in the page cache with its own mutex
 type cacheBucket struct {
     mutex sync.RWMutex
@@ -114,10 +123,12 @@ type DB struct {
 	filePath       string
 	mainFile       *os.File
 	indexFile      *os.File
+	valuesFile     *os.File  // Values file for storing variable-size values
 	mutex          sync.RWMutex  // Mutex for the database
 	seqMutex       sync.Mutex    // Mutex for transaction state and sequence numbers
 	mainFileSize   int64 // Track main file size to avoid frequent stat calls
 	indexFileSize  int64 // Track index file size to avoid frequent stat calls
+	valuesFileSize int64 // Track values file size to avoid frequent stat calls
 	prevFileSize   int64 // Track main file size before the current transaction started
 	flushFileSize  int64 // Track main file size for flush operations
 	fileLocked     bool  // Track if the files are locked
@@ -125,6 +136,8 @@ type DB struct {
 	readOnly       bool  // Track if the database is opened in read-only mode
 	pageCache      [1024]cacheBucket // Page cache for all page types
 	totalCachePages atomic.Int64     // Total number of pages in cache (including previous versions)
+	valueCache     map[int64]*ValueEntry // Value cache
+	valueCacheMutex sync.RWMutex         // Mutex for the value cache
 	freeRadixPagesHead uint32 // Page number of the head of linked list of radix pages with available sub-pages
 	lastIndexedOffset int64 // Track the offset of the last indexed content in the main file
 	writeMode      string // Current write mode
@@ -246,17 +259,29 @@ func Open(path string, options ...Options) (*DB, error) {
 		mainFileExists = true
 	}
 
-	// Generate index file path by adding '-index' suffix
-	indexPath := path + "-index"
+	// Generate index file path by adding '-keys' suffix
+	indexPath := path + "-keys"
 	indexFileExists := false
 	if _, err := os.Stat(indexPath); err == nil {
 		indexFileExists = true
+	}
+
+	// Generate values file path by adding '-values' suffix
+	valuesPath := path + "-values"
+	valuesFileExists := false
+	if _, err := os.Stat(valuesPath); err == nil {
+		valuesFileExists = true
 	}
 
 	if !mainFileExists && indexFileExists {
 		// Remove index file if main file doesn't exist
 		os.Remove(indexPath)
 		indexFileExists = false
+	}
+	if !mainFileExists && valuesFileExists {
+		// Remove values file if main file doesn't exist
+		os.Remove(valuesPath)
+		valuesFileExists = false
 	}
 	if !indexFileExists {
 		// Remove WAL file if index file doesn't exist
@@ -350,6 +375,24 @@ func Open(path string, options ...Options) (*DB, error) {
 		}
 	}
 
+	// Open values file with appropriate flags
+	var valuesFile *os.File
+	if readOnly {
+		valuesFile, err = os.OpenFile(valuesPath, os.O_RDONLY, 0666)
+		if err != nil {
+			mainFile.Close()
+			indexFile.Close()
+			return nil, fmt.Errorf("failed to open values file in read-only mode: %w", err)
+		}
+	} else {
+		valuesFile, err = os.OpenFile(valuesPath, os.O_RDWR|os.O_CREATE, 0666)
+		if err != nil {
+			mainFile.Close()
+			indexFile.Close()
+			return nil, fmt.Errorf("failed to open values file: %w", err)
+		}
+	}
+
 	// Get initial file sizes
 	mainFileInfo, err := mainFile.Stat()
 	if err != nil {
@@ -362,7 +405,16 @@ func Open(path string, options ...Options) (*DB, error) {
 	if err != nil {
 		mainFile.Close()
 		indexFile.Close()
+		valuesFile.Close()
 		return nil, fmt.Errorf("failed to get index file size: %w", err)
+	}
+
+	valuesFileInfo, err := valuesFile.Stat()
+	if err != nil {
+		mainFile.Close()
+		indexFile.Close()
+		valuesFile.Close()
+		return nil, fmt.Errorf("failed to get values file size: %w", err)
 	}
 
 	db := &DB{
@@ -370,8 +422,10 @@ func Open(path string, options ...Options) (*DB, error) {
 		filePath:           path,
 		mainFile:           mainFile,
 		indexFile:          indexFile,
+		valuesFile:         valuesFile,
 		mainFileSize:       mainFileInfo.Size(),
 		indexFileSize:      indexFileInfo.Size(),
+		valuesFileSize:     valuesFileInfo.Size(),
 		readOnly:           readOnly,
 		lockType:           LockNone,
 		dirtyPageCount:     0,
@@ -380,6 +434,7 @@ func Open(path string, options ...Options) (*DB, error) {
 		checkpointThreshold: checkpointThreshold,
 		workerChannel:      make(chan string, 10), // Buffer size of 10 for commands
 		pendingCommands:    make(map[string]bool), // Initialize the pending commands map
+		valueCache:         make(map[int64]*ValueEntry), // Initialize the value cache
 	}
 
 	// Initialize each bucket's map
@@ -434,6 +489,7 @@ func Open(path string, options ...Options) (*DB, error) {
 			db.Unlock()
 			mainFile.Close()
 			indexFile.Close()
+			valuesFile.Close()
 			return nil, fmt.Errorf("failed to read main file header: %w", err)
 		}
 		// Initialize a new index file
@@ -442,6 +498,7 @@ func Open(path string, options ...Options) (*DB, error) {
 			db.Unlock()
 			mainFile.Close()
 			indexFile.Close()
+			valuesFile.Close()
 			return nil, fmt.Errorf("failed to initialize index file: %w", err)
 		}
 		debugPrint("Index file rebuilt successfully\n")
@@ -451,19 +508,23 @@ func Open(path string, options ...Options) (*DB, error) {
 			db.Unlock()
 			mainFile.Close()
 			indexFile.Close()
+			valuesFile.Close()
 			return nil, fmt.Errorf("failed to read database header: %w", err)
 		}
 	}
 
-	// If the index file is not up-to-date, reindex the remaining content
+	// TODO: Implement recovery logic for unindexed content
+	/*
 	if db.lastIndexedOffset < db.mainFileSize {
 		if err := db.recoverUnindexedContent(); err != nil {
 			db.Unlock()
 			mainFile.Close()
 			indexFile.Close()
+			valuesFile.Close()
 			return nil, fmt.Errorf("failed to reindex database: %w", err)
 		}
 	}
+	*/
 
 	// Ensure txnSequence starts at 1
 	db.txnSequence = 1
@@ -656,10 +717,10 @@ func (db *DB) Close() error {
 	db.mutex.Lock()
 	defer db.mutex.Unlock()
 
-	var mainErr, indexErr, flushErr error
+	var mainErr, indexErr, valuesErr, flushErr error
 
 	// Check if already closed
-	if db.mainFile == nil && db.indexFile == nil {
+	if db.mainFile == nil && db.indexFile == nil && db.valuesFile == nil {
 		return nil // Already closed
 	}
 
@@ -708,6 +769,12 @@ func (db *DB) Close() error {
 		db.indexFile = nil
 	}
 
+	// Close values file if open
+	if db.valuesFile != nil {
+		valuesErr = db.valuesFile.Close()
+		db.valuesFile = nil
+	}
+
 	// Return first error encountered
 	if flushErr != nil {
 		return flushErr
@@ -715,7 +782,10 @@ func (db *DB) Close() error {
 	if mainErr != nil {
 		return mainErr
 	}
-	return indexErr
+	if indexErr != nil {
+		return indexErr
+	}
+	return valuesErr
 }
 
 // Delete removes a key from the database
@@ -805,14 +875,14 @@ func (db *DB) set(key, value []byte) error {
 				return nil
 			}
 
-			// Append the data to the main file
-			dataOffset, err := db.appendData(key, value)
+			// Store the value
+			valueOffset, err := db.storeValue(value)
 			if err != nil {
 				return fmt.Errorf("failed to append data: %w", err)
 			}
 
 			// Create a path for this byte
-			return db.createPathForByte(radixSubPage, key, keyPos, dataOffset)
+			return db.createPathForByte(radixSubPage, key, keyPos, valueOffset)
 		}
 
 		// There's an entry for this byte, load the page
@@ -847,8 +917,9 @@ func (db *DB) set(key, value []byte) error {
 	return db.setOnEmptySuffix(radixSubPage, key, value, 0)
 }
 
+/*
 // setKvOnIndex sets an existing key-value pair on the index (reindexing)
-func (db *DB) setKvOnIndex(rootSubPage *RadixSubPage, key, value []byte, dataOffset int64) error {
+func (db *DB) setKvOnIndex(rootSubPage *RadixSubPage, key, value []byte, valueOffset int64) error {
 
 	// Process the key byte by byte to find where to add it
 	radixSubPage := rootSubPage
@@ -865,7 +936,7 @@ func (db *DB) setKvOnIndex(rootSubPage *RadixSubPage, key, value []byte, dataOff
 		// If there's no entry for this byte, create a new path
 		if nextPageNumber == 0 {
 			// Create a path for this byte
-			return db.createPathForByte(radixSubPage, key, keyPos, dataOffset)
+			return db.createPathForByte(radixSubPage, key, keyPos, valueOffset)
 		}
 
 		// There's an entry for this byte, load the page
@@ -889,7 +960,7 @@ func (db *DB) setKvOnIndex(rootSubPage *RadixSubPage, key, value []byte, dataOff
 				SubPageIdx: nextSubPageIdx,
 			}
 			// Attempt to set the key and value on the leaf sub-page
-			return db.setOnLeafSubPage(radixSubPage, leafSubPage, key, keyPos, value, dataOffset)
+			return db.setOnLeafSubPage(radixSubPage, leafSubPage, key, keyPos, value, valueOffset)
 		} else {
 			return fmt.Errorf("invalid page type")
 		}
@@ -897,12 +968,13 @@ func (db *DB) setKvOnIndex(rootSubPage *RadixSubPage, key, value []byte, dataOff
 
 	// If we've processed all bytes of the key
 	// Set the content offset on the empty suffix slot
-	return db.setOnEmptySuffix(radixSubPage, key, value, dataOffset)
+	return db.setOnEmptySuffix(radixSubPage, key, value, valueOffset)
 }
+*/
 
-// setContentOnIndex sets a suffix + content offset pair on the index
+// setContentOnIndex sets a suffix + value offset pair on the index
 // it is used when converting a leaf page into a radix page
-func (db *DB) setContentOnIndex(subPage *RadixSubPage, suffix []byte, suffixPos int, contentOffset int64) error {
+func (db *DB) setContentOnIndex(subPage *RadixSubPage, suffix []byte, suffixPos int, valueOffset int64) error {
 
 	// Process the suffix byte by byte
 	radixSubPage := subPage
@@ -918,7 +990,7 @@ func (db *DB) setContentOnIndex(subPage *RadixSubPage, suffix []byte, suffixPos 
 		// If there's no entry for this byte, create a new path
 		if nextPageNumber == 0 {
 			// Create a path for this byte
-			return db.createPathForByte(radixSubPage, suffix, suffixPos, contentOffset)
+			return db.createPathForByte(radixSubPage, suffix, suffixPos, valueOffset)
 		}
 
 		// There's an entry for this byte, load the page
@@ -947,7 +1019,7 @@ func (db *DB) setContentOnIndex(subPage *RadixSubPage, suffix []byte, suffixPos 
 
 			// Try to add the entry with the suffix to the leaf sub-page
 			// If the leaf sub-page is full, it will be converted to a radix sub-page
-			return db.addEntryToLeafSubPage(radixSubPage, byteValue, leafSubPage, remainingSuffix, contentOffset)
+			return db.addEntryToLeafSubPage(radixSubPage, byteValue, leafSubPage, remainingSuffix, valueOffset)
 		} else {
 			return fmt.Errorf("invalid page type")
 		}
@@ -955,11 +1027,11 @@ func (db *DB) setContentOnIndex(subPage *RadixSubPage, suffix []byte, suffixPos 
 
 	// We've processed all bytes of the key
 	// Set the content offset on the empty suffix slot
-	return db.setEmptySuffixOffset(radixSubPage, contentOffset)
+	return db.setEmptySuffixOffset(radixSubPage, valueOffset)
 }
 
 // createPathForByte creates a new path for a byte in the key
-func (db *DB) createPathForByte(subPage *RadixSubPage, key []byte, keyPos int, dataOffset int64) error {
+func (db *DB) createPathForByte(subPage *RadixSubPage, key []byte, keyPos int, valueOffset int64) error {
 
 	// Get the current byte from the key
 	byteValue := key[keyPos]
@@ -976,7 +1048,7 @@ func (db *DB) createPathForByte(subPage *RadixSubPage, key []byte, keyPos int, d
 		}
 
 		// Set the empty suffix offset
-		err = db.setEmptySuffixOffset(childSubPage, dataOffset)
+		err = db.setEmptySuffixOffset(childSubPage, valueOffset)
 		if err != nil {
 			return fmt.Errorf("failed to set empty suffix offset: %w", err)
 		}
@@ -994,7 +1066,7 @@ func (db *DB) createPathForByte(subPage *RadixSubPage, key []byte, keyPos int, d
 	} else {
 		// Non-empty suffix
 		// Add the entry with the suffix to a new leaf sub-page
-		leafSubPage, err := db.addEntryToNewLeafSubPage(suffix, dataOffset)
+		leafSubPage, err := db.addEntryToNewLeafSubPage(suffix, valueOffset)
 		if err != nil {
 			return fmt.Errorf("failed to add leaf entry: %w", err)
 		}
@@ -1015,9 +1087,9 @@ func (db *DB) createPathForByte(subPage *RadixSubPage, key []byte, keyPos int, d
 }
 
 // setOnLeafSubPage attempts to set a key-value pair on an existing leaf sub-page
-// If dataOffset is 0, we're setting a new key-value pair
+// If valueOffset is 0, we're setting a new key-value pair
 // Otherwise, it means we're reindexing already stored key-value pair
-func (db *DB) setOnLeafSubPage(parentSubPage *RadixSubPage, subPage *LeafSubPage, key []byte, keyPos int, value []byte, dataOffset int64) error {
+func (db *DB) setOnLeafSubPage(parentSubPage *RadixSubPage, subPage *LeafSubPage, key []byte, keyPos int, value []byte, valueOffset int64) error {
 	var err error
 	leafPage := subPage.Page
 	subPageIdx := subPage.SubPageIdx
@@ -1037,37 +1109,32 @@ func (db *DB) setOnLeafSubPage(parentSubPage *RadixSubPage, subPage *LeafSubPage
 	}
 
 	// Search for the suffix in this sub-page
-	entryOffset, entrySize, existingDataOffset, err := db.findEntryInLeafSubPage(leafPage, subPageIdx, suffix)
+	entryOffset, entrySize, existingValueOffset, err := db.findEntryInLeafSubPage(leafPage, subPageIdx, suffix)
 	if err != nil {
 		return fmt.Errorf("failed to search entries in sub-page: %w", err)
 	}
 
 	if entryOffset >= 0 {
 		// Found the entry
-		var content *Content
+		var existingValue []byte
 
 		// If we're setting a new key-value pair
-		if dataOffset == 0 {
-			// Read the content from the main file
-			content, err = db.readContent(existingDataOffset)
+		if valueOffset == 0 {
+			// Read the value from the value file
+			existingValue, err = db.readValue(existingValueOffset)
 			if err != nil {
-				return fmt.Errorf("failed to read content: %w", err)
-			}
-
-			// Verify that the key matches
-			if !equal(content.key, key) {
-				return fmt.Errorf("invalid indexed key")
+				return fmt.Errorf("failed to read value: %w", err)
 			}
 		}
 
 		// If we're deleting
 		if isDelete {
 			// If there is an existing value
-			if dataOffset == 0 && content != nil && len(content.value) > 0 {
-				// Log the deletion to the main file
-				dataOffset, err = db.appendData(key, nil)
+			if valueOffset == 0 && existingValue != nil && len(existingValue) > 0 {
+				// Log the deletion
+				err = db.deleteValue(existingValueOffset)
 				if err != nil {
-					return fmt.Errorf("failed to append deletion: %w", err)
+					return fmt.Errorf("failed to delete value: %w", err)
 				}
 			}
 
@@ -1076,22 +1143,22 @@ func (db *DB) setOnLeafSubPage(parentSubPage *RadixSubPage, subPage *LeafSubPage
 		}
 
 		// If we're setting a new key-value pair
-		if dataOffset == 0 {
+		if valueOffset == 0 {
 			// Check if value is the same
-			if equal(content.value, value) {
+			if equal(existingValue, value) {
 				// Value is the same, nothing to do
 				return nil
 			}
 
-			// Value is different, append new data
-			dataOffset, err = db.appendData(key, value)
+			// Value is different, store new value
+			valueOffset, err = db.storeValue(value, existingValueOffset)
 			if err != nil {
-				return fmt.Errorf("failed to append data: %w", err)
+				return fmt.Errorf("failed to store value: %w", err)
 			}
 		}
 
-		// Update the entry's data offset in the sub-page
-		err = db.updateEntryInLeafSubPage(subPage, entryOffset, entrySize, dataOffset)
+		// Update the entry's value offset in the sub-page
+		err = db.updateEntryInLeafSubPage(subPage, entryOffset, entrySize, valueOffset)
 		if err != nil {
 			return fmt.Errorf("failed to update entry in sub-page: %w", err)
 		}
@@ -1105,23 +1172,23 @@ func (db *DB) setOnLeafSubPage(parentSubPage *RadixSubPage, subPage *LeafSubPage
 	}
 
 	// If we're setting a new key-value pair
-	if dataOffset == 0 {
-		// Suffix not found, append new data
-		dataOffset, err = db.appendData(key, value)
+	if valueOffset == 0 {
+		// Suffix not found, store new value
+		valueOffset, err = db.storeValue(value)
 		if err != nil {
-			return fmt.Errorf("failed to append data: %w", err)
+			return fmt.Errorf("failed to store value: %w", err)
 		}
 	}
 
 	// Try to add the entry with the suffix to this sub-page
 	// If the leaf sub-page is full, it will be converted to a radix sub-page
-	return db.addEntryToLeafSubPage(parentSubPage, parentByteValue, subPage, suffix, dataOffset)
+	return db.addEntryToLeafSubPage(parentSubPage, parentByteValue, subPage, suffix, valueOffset)
 }
 
 // setOnEmptySuffix attempts to set a key and value on an empty suffix in a radix sub-page
-// If dataOffset is 0, we're setting a new key-value pair
+// If valueOffset is 0, we're setting a new key-value pair
 // Otherwise, it means we're reindexing already stored key-value pair
-func (db *DB) setOnEmptySuffix(subPage *RadixSubPage, key, value []byte, dataOffset int64) error {
+func (db *DB) setOnEmptySuffix(subPage *RadixSubPage, key, value []byte, valueOffset int64) error {
 	var err error
 
 	// Check if we're deleting
@@ -1137,30 +1204,25 @@ func (db *DB) setOnEmptySuffix(subPage *RadixSubPage, key, value []byte, dataOff
 
 	// If we have an empty suffix offset, read the content to verify the key
 	if emptySuffixOffset > 0 {
-		var content *Content
+		var existingValue []byte
 
 		// If we're setting a new key-value pair
-		if dataOffset == 0 {
-			// Read the content at the offset
-			content, err = db.readContent(emptySuffixOffset)
+		if valueOffset == 0 {
+			// Read the value at the offset
+			existingValue, err = db.readValue(emptySuffixOffset)
 			if err != nil {
-				return fmt.Errorf("failed to read content: %w", err)
-			}
-
-			// Verify that the key matches
-			if !equal(content.key, key) {
-				return fmt.Errorf("invalid indexed key")
+				return fmt.Errorf("failed to read value: %w", err)
 			}
 		}
 
 		// If we're deleting
 		if isDelete {
 			// If there is an existing value
-			if dataOffset == 0 && content != nil && len(content.value) > 0 {
-				// Log the deletion to the main file
-				dataOffset, err = db.appendData(key, nil)
+			if valueOffset == 0 && existingValue != nil && len(existingValue) > 0 {
+				// Log the deletion
+				err = db.deleteValue(emptySuffixOffset)
 				if err != nil {
-					return fmt.Errorf("failed to append deletion: %w", err)
+					return fmt.Errorf("failed to delete value: %w", err)
 				}
 			}
 			// Clear the empty suffix offset
@@ -1168,9 +1230,9 @@ func (db *DB) setOnEmptySuffix(subPage *RadixSubPage, key, value []byte, dataOff
 		}
 
 		// If we're setting a new key-value pair
-		if dataOffset == 0 {
+		if valueOffset == 0 {
 			// Check if value is the same
-			if equal(content.value, value) {
+			if equal(existingValue, value) {
 				// Value is the same, nothing to do
 				return nil
 			}
@@ -1181,16 +1243,16 @@ func (db *DB) setOnEmptySuffix(subPage *RadixSubPage, key, value []byte, dataOff
 	}
 
 	// If we're setting a new key-value pair
-	if dataOffset == 0 {
-		// No empty suffix or key mismatch, append new data
-		dataOffset, err = db.appendData(key, value)
+	if valueOffset == 0 {
+		// No empty suffix or key mismatch, store new value
+		valueOffset, err = db.storeValue(value)
 		if err != nil {
 			return fmt.Errorf("failed to append data: %w", err)
 		}
 	}
 
 	// Set the empty suffix offset
-	return db.setEmptySuffixOffset(subPage, dataOffset)
+	return db.setEmptySuffixOffset(subPage, valueOffset)
 }
 
 // Get retrieves a value for the given key
@@ -1275,25 +1337,14 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 			}
 
 			// Search for the suffix in this sub-page's entries
-			entryOffset, _, dataOffset, err := db.findEntryInLeafSubPage(leafPage, leafSubPage.SubPageIdx, suffix)
+			entryOffset, _, valueOffset, err := db.findEntryInLeafSubPage(leafPage, leafSubPage.SubPageIdx, suffix)
 			if err != nil {
 				return nil, fmt.Errorf("failed to search entries in sub-page: %w", err)
 			}
 
 			if entryOffset >= 0 {
-				// Found the entry, read the content from the main file
-				content, err := db.readContent(dataOffset)
-				if err != nil {
-					return nil, fmt.Errorf("failed to read content: %w", err)
-				}
-
-				// Verify that the key matches
-				if !equal(content.key, key) {
-					return nil, fmt.Errorf("invalid indexed key")
-				}
-
-				// Return the value
-				return content.value, nil
+				// Found the entry, read the value
+				return db.readValue(valueOffset)
 			}
 
 			// If we get here, the suffix wasn't found
@@ -1307,19 +1358,8 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	// check if there's an empty suffix in the current sub-page
 	emptySuffixOffset := db.getEmptySuffixOffset(currentSubPage)
 	if emptySuffixOffset > 0 {
-		// Read the content at the offset
-		content, err := db.readContent(emptySuffixOffset)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read content: %w", err)
-		}
-
-		// Verify that the key matches
-		if !equal(content.key, key) {
-			return nil, fmt.Errorf("invalid indexed key")
-		}
-
-		// Return the value
-		return content.value, nil
+		// Read the value at the offset
+		return db.readValue(emptySuffixOffset)
 	}
 
 	return nil, fmt.Errorf("key not found")
@@ -1361,6 +1401,11 @@ func (db *DB) initialize() error {
 	// Initialize index file
 	if err := db.initializeIndexFile(); err != nil {
 		return fmt.Errorf("failed to initialize index file: %w", err)
+	}
+
+	// Initialize values file
+	if err := db.initializeValuesFile(); err != nil {
+		return fmt.Errorf("failed to initialize values file: %w", err)
 	}
 
 	// Restore the original journal mode
@@ -1447,6 +1492,34 @@ func (db *DB) initializeIndexFile() error {
 	return nil
 }
 
+// initializeValuesFile initializes the values file with a header
+func (db *DB) initializeValuesFile() error {
+	// Write values file header
+	header := make([]byte, PageSize)
+
+	// Write the 6-byte magic string
+	copy(header[0:6], ValuesFileMagicString)
+
+	// Write the 2-byte version
+	copy(header[6:8], VersionString)
+
+	// Write the 8-byte database ID
+	binary.LittleEndian.PutUint64(header[8:16], db.databaseID)
+
+	// The rest of the header is reserved for future use
+
+	debugPrint("Writing values file header to disk\n")
+	// Write the header to the file
+	if _, err := db.valuesFile.Write(header); err != nil {
+		return err
+	}
+
+	// Update file size to include the header
+	db.valuesFileSize = PageSize
+
+	return nil
+}
+
 // readHeader reads the database headers and preloads radix levels
 func (db *DB) readHeader() error {
 	// Read main file header
@@ -1457,6 +1530,11 @@ func (db *DB) readHeader() error {
 	// Read the index file header directly from the index file
 	if err := db.readIndexFileHeader(false); err != nil {
 		return fmt.Errorf("failed to read index file header: %w", err)
+	}
+
+	// Read the values file header
+	if err := db.readValuesFileHeader(); err != nil {
+		return fmt.Errorf("failed to read values file header: %w", err)
 	}
 
 	// Check for existing WAL file if in WAL mode
@@ -1558,12 +1636,12 @@ func (db *DB) readIndexFileHeader(finalRead bool) error {
 		}
 
 		// Delete the index file
-		if err := os.Remove(db.filePath + "-index"); err != nil {
+		if err := os.Remove(db.filePath + "-keys"); err != nil {
 			return fmt.Errorf("failed to delete index file: %w", err)
 		}
 
 		// Reopen the index file
-		db.indexFile, err = os.OpenFile(db.filePath + "-index", os.O_RDWR|os.O_CREATE, 0666)
+		db.indexFile, err = os.OpenFile(db.filePath + "-keys", os.O_RDWR|os.O_CREATE, 0666)
 		if err != nil {
 			return fmt.Errorf("failed to reopen index file: %w", err)
 		}
@@ -1594,6 +1672,50 @@ func (db *DB) readIndexFileHeader(finalRead bool) error {
 		}
 
 		// The array of leaf pages with free space is parsed in parseHeaderPage
+	}
+
+	return nil
+}
+
+// readValuesFileHeader reads and validates the values file header
+func (db *DB) readValuesFileHeader() error {
+	// If values file is empty, initialize it
+	//if db.valuesFileSize == 0 {
+	//	return db.initializeValuesFile()
+	//}
+
+	// Read the header (16 bytes minimum for magic + version + database ID)
+	header := make([]byte, 16)
+	if _, err := db.valuesFile.ReadAt(header, 0); err != nil {
+		return fmt.Errorf("failed to read values file header: %w", err)
+	}
+
+	// Extract magic string (6 bytes)
+	fileMagic := string(header[0:6])
+
+	// Extract version (2 bytes)
+	fileVersion := string(header[6:8])
+
+	if fileMagic != ValuesFileMagicString {
+		return fmt.Errorf("invalid values file format")
+	}
+
+	if fileVersion != VersionString {
+		return fmt.Errorf("unsupported values file version")
+	}
+
+	// Extract database ID (8 bytes)
+	valuesDatabaseID := binary.LittleEndian.Uint64(header[8:16])
+
+	// Check if the database ID matches the main file
+	if db.databaseID != 0 && valuesDatabaseID != db.databaseID {
+		debugPrint("Values file database ID mismatch: %d vs %d\n", valuesDatabaseID, db.databaseID)
+		return fmt.Errorf("values file database ID mismatch")
+	}
+
+	// Ensure values file size is at least PageSize to account for header
+	if db.valuesFileSize < PageSize {
+		db.valuesFileSize = PageSize
 	}
 
 	return nil
@@ -1734,6 +1856,7 @@ func (db *DB) initializeIndexHeader() error {
 // Main file
 // ------------------------------------------------------------------------------------------------
 
+/*
 // appendData appends a key-value pair to the end of the file and returns its offset
 func (db *DB) appendData(key, value []byte) (int64, error) {
 	// Use stored file size to determine where to append
@@ -1925,6 +2048,180 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 	}
 
 	return content, nil
+}
+*/
+
+// ------------------------------------------------------------------------------------------------
+// Values file
+// ------------------------------------------------------------------------------------------------
+
+// storeValue stores a value in the value cache and returns its offset
+// If existingOffset is provided and the new value fits in the same space, it reuses the offset
+// Otherwise, it appends to the end of the values file (starting from PageSize to account for header)
+func (db *DB) storeValue(value []byte, existingOffset ...int64) (int64, error) {
+	/*
+	// Check if we should try to reuse an existing offset
+	if len(existingOffset) > 0 && existingOffset[0] > 0 {
+		// Try to reuse the existing offset if the value fits
+		db.valueCacheMutex.RLock()
+		existingEntry, exists := db.valueCache[existingOffset[0]]
+		db.valueCacheMutex.RUnlock()
+
+		if exists {
+			// Calculate the size needed for the new value
+			newValueSize := varint.Size(uint64(len(value))) + len(value)
+			existingValueSize := varint.Size(uint64(len(existingEntry.value))) + len(existingEntry.value)
+
+			// If the new value fits in the same space, reuse the offset
+			if newValueSize <= existingValueSize {
+				// Update the value in the cache with versioning
+				db.valueCacheMutex.Lock()
+				currentEntry := db.valueCache[existingOffset[0]]
+				newEntry := &ValueEntry{
+					value:       value,
+					txnSequence: db.txnSequence,
+					isWAL:       false,
+					next:        currentEntry, // Link to previous version
+				}
+				db.valueCache[existingOffset[0]] = newEntry
+				db.valueCacheMutex.Unlock()
+				return existingOffset[0], nil
+			}
+		}
+	}
+	*/
+
+	// Allocate a new offset at the end of the values file
+	// Ensure we start from PageSize (4096) if the file only contains header
+	offset := db.valuesFileSize
+	if offset < PageSize {
+		offset = PageSize
+	}
+
+	// Update the values file size
+	valueSize := varint.Size(uint64(len(value))) + len(value) + 1 // 1 byte for type ('V')
+	db.valuesFileSize = offset + int64(valueSize)
+
+	// Store the value in the cache with versioning support
+	db.valueCacheMutex.Lock()
+	existingEntry := db.valueCache[offset]
+	newEntry := &ValueEntry{
+		value:       value,
+		txnSequence: db.txnSequence,
+		isWAL:       false,
+		next:        existingEntry, // Link to previous version if it exists
+	}
+	db.valueCache[offset] = newEntry
+	db.valueCacheMutex.Unlock()
+
+	debugPrint("Stored value at offset %d, size %d\n", offset, valueSize)
+	return offset, nil
+}
+
+// deleteValue marks a value as deleted by changing its type from 'V' to 'F'
+func (db *DB) deleteValue(offset int64) error {
+	// Mark as deleted by storing an empty value with versioning
+	db.valueCacheMutex.Lock()
+	currentEntry := db.valueCache[offset]
+	newEntry := &ValueEntry{
+		value:       nil, // Mark as deleted with nil value
+		txnSequence: db.txnSequence,
+		isWAL:       false,
+		next:        currentEntry, // Link to previous version
+	}
+	db.valueCache[offset] = newEntry
+	db.valueCacheMutex.Unlock()
+
+	debugPrint("Marked value at offset %d as deleted\n", offset)
+	return nil
+}
+
+// readValue reads a value from the cache or values file
+func (db *DB) readValue(offset int64, maxReadSeq ...int64) ([]byte, error) {
+
+	// Not in cache, read from values file
+	// Values start at PageSize (4096) due to header
+	if offset < PageSize || offset >= db.valuesFileSize {
+		return nil, fmt.Errorf("offset out of values file bounds: %d", offset)
+	}
+
+	// Determine the maximum transaction sequence number that can be read
+	var maxReadSequence int64
+	if len(maxReadSeq) > 0 && maxReadSeq[0] > 0 {
+		maxReadSequence = maxReadSeq[0]
+	} else {
+		// Default behavior: use current transaction sequence
+		db.seqMutex.Lock()
+		if db.calledByTransaction || !db.inTransaction {
+			maxReadSequence = db.txnSequence
+		} else {
+			maxReadSequence = db.txnSequence - 1
+		}
+		db.seqMutex.Unlock()
+	}
+
+	// First check the value cache
+	db.valueCacheMutex.RLock()
+	entry, exists := db.valueCache[offset]
+
+	// If maxReadSequence is specified, find the latest version that's <= maxReadSequence
+	if exists && maxReadSequence > 0 {
+		for ; entry != nil; entry = entry.next {
+			if entry.txnSequence <= maxReadSequence {
+				break
+			}
+		}
+		// If we did not find a valid entry version
+		if entry == nil {
+			exists = false
+		}
+	}
+	db.valueCacheMutex.RUnlock()
+
+	if exists {
+		// Return the cached value (nil for deleted values)
+		return entry.value, nil
+	}
+
+	// Read the type byte first
+	typeBuf := make([]byte, 1)
+	if _, err := db.valuesFile.ReadAt(typeBuf, offset); err != nil {
+		return nil, fmt.Errorf("failed to read value type: %w", err)
+	}
+
+	valueType := typeBuf[0]
+	currentOffset := offset + 1
+
+	// For deleted values, return nil
+	if valueType == 'F' {
+		return nil, nil
+	}
+
+	// For unknown types, return an error
+	if valueType != 'V' {
+		return nil, fmt.Errorf("unknown value type: %c", valueType)
+	}
+
+	// Read the value size
+	sizeBuf := make([]byte, 10) // Enough for varint
+	if _, err := db.valuesFile.ReadAt(sizeBuf, currentOffset); err != nil {
+		return nil, fmt.Errorf("failed to read value size: %w", err)
+	}
+
+	valueSize64, bytesRead := varint.Read(sizeBuf)
+	if bytesRead == 0 {
+		return nil, fmt.Errorf("failed to parse value size")
+	}
+	valueSize := int(valueSize64)
+	currentOffset += int64(bytesRead)
+
+	// Read the value data
+	valueData := make([]byte, valueSize)
+	if _, err := db.valuesFile.ReadAt(valueData, currentOffset); err != nil {
+		return nil, fmt.Errorf("failed to read value data: %w", err)
+	}
+
+	return valueData, nil
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -2154,7 +2451,7 @@ func (db *DB) parseLeafSubPages(leafPage *LeafPage) error {
 // iterateLeafSubPageEntries iterates through entries in a leaf sub-page, calling the callback for each entry
 // The callback receives the entry offset (relative to leaf page data), entry size, and entry data
 // Returns true to continue or false to stop
-func (db *DB) iterateLeafSubPageEntries(leafPage *LeafPage, subPageIdx uint8, callback func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, dataOffset int64) bool) error {
+func (db *DB) iterateLeafSubPageEntries(leafPage *LeafPage, subPageIdx uint8, callback func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, valueOffset int64) bool) error {
 	// Get the sub-page info
 	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx].Offset == 0 {
 		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
@@ -2190,14 +2487,14 @@ func (db *DB) iterateLeafSubPageEntries(leafPage *LeafPage, subPageIdx uint8, ca
 		}
 
 		// Read data offset
-		dataOffset := int64(binary.LittleEndian.Uint64(leafPage.data[pos:]))
+		valueOffset := int64(binary.LittleEndian.Uint64(leafPage.data[pos:]))
 		pos += 8
 
 		// Calculate entry size
 		entrySize := bytesRead + suffixLen + 8 // varint + suffix + data offset
 
 		// Call the callback with the entry information
-		if !callback(entryOffset, entrySize, suffixOffset, suffixLen, dataOffset) {
+		if !callback(entryOffset, entrySize, suffixOffset, suffixLen, valueOffset) {
 			break
 		}
 	}
@@ -2213,12 +2510,12 @@ func (db *DB) findEntryInLeafSubPage(leafPage *LeafPage, subPageIdx uint8, targe
 	var foundEntrySize int = 0
 	var foundDataOffset int64 = 0
 
-	err := db.iterateLeafSubPageEntries(leafPage, subPageIdx, func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, dataOffset int64) bool {
+	err := db.iterateLeafSubPageEntries(leafPage, subPageIdx, func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, valueOffset int64) bool {
 		// Compare directly with target suffix (no copy needed)
 		if suffixLen == len(targetSuffix) && bytes.Equal(leafPage.data[suffixOffset:suffixOffset+suffixLen], targetSuffix) {
 			foundEntryOffset = entryOffset
 			foundEntrySize   = entrySize
-			foundDataOffset  = dataOffset
+			foundDataOffset  = valueOffset
 			return false // Stop iteration
 		}
 
@@ -2396,6 +2693,13 @@ func (db *DB) RefreshFileSize() error {
 		return fmt.Errorf("failed to get index file size: %w", err)
 	}
 	db.indexFileSize = indexFileInfo.Size()
+
+	// Refresh values file size
+	valuesFileInfo, err := db.valuesFile.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to get values file size: %w", err)
+	}
+	db.valuesFileSize = valuesFileInfo.Size()
 
 	return nil
 }
@@ -2580,6 +2884,8 @@ func (db *DB) beginTransaction() {
 func (db *DB) commitTransaction() {
 	debugPrint("Committing transaction %d\n", db.txnSequence)
 
+	// TODO: Implement commit marker
+	/*
 	// Write commit marker to the main file if data was written in this transaction
 	if !db.readOnly && db.mainFileSize > db.prevFileSize {
 		if err := db.appendCommitMarker(); err != nil {
@@ -2587,6 +2893,7 @@ func (db *DB) commitTransaction() {
 			// Continue with commit even if marker fails
 		}
 	}
+	*/
 
 	// Release transaction lock if it was acquired for this transaction
 	if db.lockAcquiredForTransaction {
@@ -2624,6 +2931,9 @@ func (db *DB) rollbackTransaction() {
 
 	// Discard pages from this transaction (they should be reloaded from the index file)
 	db.discardNewerPages(db.txnSequence)
+
+	// Discard values from this transaction
+	db.discardNewerValues(db.txnSequence)
 
 	// Release transaction lock if it was acquired for this transaction
 	if db.lockAcquiredForTransaction {
@@ -2839,6 +3149,8 @@ func (db *DB) checkPageCache(isWrite bool) {
 
 		// Check which thread should remove the old pages
 		if db.commitMode == CallerThread {
+			// Discard previous versions of values
+			db.discardOldValueVersions(true)
 			// Discard previous versions of pages
 			numPages := db.discardOldPageVersions(true)
 			// If the number of pages is still greater than the cache size threshold
@@ -2862,6 +3174,8 @@ func (db *DB) checkPageCache(isWrite bool) {
 // discardNewerPages removes pages from the current transaction from the cache
 // This function is called by the main thread when a transaction is rolled back
 func (db *DB) discardNewerPages(currentSeq int64) {
+	debugPrint("Discarding newer pages from transaction %d\n", currentSeq)
+
 	// Iterate through all pages in the cache
 	db.iteratePages(func(bucket *cacheBucket, pageNumber uint32, page *Page) {
 		// Skip pages from the current transaction
@@ -2893,12 +3207,36 @@ func (db *DB) discardNewerPages(currentSeq int64) {
 	})
 }
 
+// discardNewerValues removes values that are from the current transaction from the value cache
+// This function is called by the main thread when a transaction is rolled back
+func (db *DB) discardNewerValues(currentSeq int64) {
+	debugPrint("Discarding newer values from transaction %d\n", currentSeq)
+
+	db.valueCacheMutex.Lock()
+	defer db.valueCacheMutex.Unlock()
+
+	for offset, entry := range db.valueCache {
+		// Find the first entry that's not from the current transaction
+		var newHead *ValueEntry = entry
+		for newHead != nil && newHead.txnSequence == currentSeq {
+			newHead = newHead.next
+		}
+		// Update the cache with the new head (or delete if no valid entries remain)
+		if newHead != nil {
+			db.valueCache[offset] = newHead
+		} else {
+			delete(db.valueCache, offset)
+		}
+	}
+}
+
 // discardOldPageVersions removes older versions of pages from the cache
 // keepWAL: if true, keep the first WAL page, otherwise clear the isWAL flag
 // returns the number of pages kept
 func (db *DB) discardOldPageVersions(keepWAL bool) int {
-	db.seqMutex.Lock()
 	var currentTxnSeq int64
+
+	db.seqMutex.Lock()
 	// If the main thread is in a transaction
 	if db.inTransaction {
 		// Keep pages from the previous transaction (because the current one can be rolled back)
@@ -2908,6 +3246,8 @@ func (db *DB) discardOldPageVersions(keepWAL bool) int {
 		currentTxnSeq = db.txnSequence
 	}
 	db.seqMutex.Unlock()
+
+	debugPrint("Discarding old page versions\n")
 
 	var totalPages int64 = 0
 
@@ -2950,11 +3290,7 @@ func (db *DB) discardOldPageVersions(keepWAL bool) int {
 					current.isWAL = false
 				}
 				// Stop if we are not keeping WAL pages
-				if keepWAL {
-					shouldStop = false
-				} else if foundFirstPage {
-					shouldStop = true
-				}
+				shouldStop = !keepWAL
 			}
 
 			if shouldKeep {
@@ -2983,6 +3319,96 @@ func (db *DB) discardOldPageVersions(keepWAL bool) int {
 	return int(totalPages)
 }
 
+// discardOldValueVersions removes old values from the value cache
+func (db *DB) discardOldValueVersions(keepWAL bool) {
+	var currentTxnSeq int64
+
+	db.seqMutex.Lock()
+	// If the main thread is in a transaction
+	if db.inTransaction {
+		// Keep values from the previous transaction (because the current one can be rolled back)
+		currentTxnSeq = db.txnSequence - 1
+	} else {
+		// Otherwise, keep values from the last committed transaction
+		currentTxnSeq = db.txnSequence
+	}
+	db.seqMutex.Unlock()
+
+	debugPrint("Discarding previous versions of values\n")
+
+	db.valueCacheMutex.Lock()
+	defer db.valueCacheMutex.Unlock()
+
+	// Clean up old values from the value cache
+	for offset, entry := range db.valueCache {
+		// Process the version chain similar to page cache
+		current := entry
+		var lastKept *ValueEntry = nil
+		foundFirstValue := false
+
+		for current != nil {
+			// Skip values from current transaction or higher - they should not be touched
+			if current.txnSequence >= currentTxnSeq {
+				// If we are not keeping WAL values, clear the isWAL flag
+				if !keepWAL && current.isWAL {
+					current.isWAL = false
+				}
+				lastKept = current
+				current = current.next
+				continue
+			}
+
+			shouldKeep := false
+			shouldStop := false
+
+			if current.isWAL {
+				// Keep only the very first WAL value
+				// If we are not keeping WAL values, discard it
+				shouldKeep = keepWAL
+				// Discard everything else after the first WAL value
+				shouldStop = true
+			} else {
+				if !foundFirstValue {
+					// Keep only the first value before WAL values
+					foundFirstValue = true
+					shouldKeep = true
+				}
+				// Stop if we are not keeping WAL values
+				shouldStop = !keepWAL
+			}
+
+			if shouldKeep {
+				// Keep this value
+				lastKept = current
+			} else {
+				// Discard this value
+				if lastKept != nil {
+					lastKept.next = current.next
+				}
+			}
+
+			if shouldStop {
+				// Discard everything after this value
+				if lastKept != nil {
+					lastKept.next = nil
+				}
+				// Stop processing
+				break
+			}
+
+			current = current.next
+		}
+
+		// Update the cache with the new head (or delete if no valid entries remain)
+		if lastKept != nil {
+			db.valueCache[offset] = entry // Keep the original head if we kept any values
+		} else {
+			delete(db.valueCache, offset)
+		}
+	}
+
+}
+
 // removeOldPagesFromCache removes old clean pages from the cache
 // it cannot remove pages that are part of the WAL
 // as other threads can be accessing these pages, this thread can only remove pages that have not been accessed recently
@@ -3006,6 +3432,9 @@ func (db *DB) removeOldPagesFromCache() {
 
 	// Compute the number of pages to remove
 	numPagesToRemove := totalPages - targetSize
+
+	debugPrint("Discarding old pages from cache. Current cache size: %d, target size: %d\n", totalPages, targetSize)
+	return
 
 	// Step 1: Use read locks to collect candidates
 	var candidates []pageInfo
@@ -3249,14 +3678,21 @@ func (db *DB) flushIndexToDisk() error {
 	}
 	db.seqMutex.Unlock()
 
+	// Flush values to WAL first (if using WAL)
+	if db.useWAL {
+		if err := db.flushValuesToWAL(); err != nil {
+			return fmt.Errorf("failed to flush values to WAL: %w", err)
+		}
+	}
+
 	// Flush all dirty pages
 	pagesWritten, err := db.flushDirtyIndexPages()
 	if err != nil {
 		return fmt.Errorf("failed to flush dirty pages: %w", err)
 	}
 
-	// If no pages were written, abort the flush
-	if pagesWritten == 0 {
+	// If no pages were written and no values were flushed, abort the flush
+	if pagesWritten == 0 && !db.useWAL {
 		return nil
 	}
 
@@ -3275,40 +3711,67 @@ func (db *DB) flushIndexToDisk() error {
 	return nil
 }
 
-/*
-// flushAllIndexPages writes all cached pages to disk
-func (db *DB) flushAllIndexPages() error {
-	db.cacheMutex.RLock()
-	defer db.cacheMutex.RUnlock()
-
-	// Get all page numbers and sort them
-	pageNumbers := make([]uint32, 0, len(db.pageCache))
-	for pageNumber := range db.pageCache {
-		pageNumbers = append(pageNumbers, pageNumber)
+// flushValuesToWAL flushes values from the value cache to the WAL file
+func (db *DB) flushValuesToWAL() error {
+	if !db.useWAL {
+		return nil
 	}
 
-	// Sort page numbers in ascending order
-	sort.Slice(pageNumbers, func(i, j int) bool {
-		return pageNumbers[i] < pageNumbers[j]
-	})
-
-	// Process pages in order
-	for _, pageNumber := range pageNumbers {
-		page := db.pageCache[pageNumber]
-		if page.pageType == ContentTypeRadix {
-			if err := db.writeRadixPage(page); err != nil {
-				return err
-			}
-		} else if page.pageType == ContentTypeLeaf {
-			if err := db.writeLeafPage(page); err != nil {
-				return err
+	db.valueCacheMutex.RLock()
+	// Create a slice to store the offsets in order
+	var offsets []int64
+	for offset, entry := range db.valueCache {
+		// Find the first version of the value that was modified up to the flush sequence
+		for ; entry != nil; entry = entry.next {
+			if entry.txnSequence <= db.flushSequence {
+				break
 			}
 		}
+		// Only flush values that are not already in WAL and within the flush sequence
+		if entry != nil && !entry.isWAL {
+			offsets = append(offsets, offset)
+		}
+	}
+	db.valueCacheMutex.RUnlock()
+
+	// Sort offsets for consistent ordering
+	sort.Slice(offsets, func(i, j int) bool {
+		return offsets[i] < offsets[j]
+	})
+
+	// Write each value to WAL in order
+	for _, offset := range offsets {
+		db.valueCacheMutex.Lock()
+		entry := db.valueCache[offset]
+
+		// Find the correct version to flush (up to flush sequence)
+		for ; entry != nil; entry = entry.next {
+			if entry.txnSequence <= db.flushSequence {
+				break
+			}
+		}
+
+		if entry == nil || entry.isWAL {
+			db.valueCacheMutex.Unlock()
+			continue
+		}
+
+		value := entry.value
+		db.valueCacheMutex.Unlock()
+
+		// Write to WAL
+		if err := db.writeValueToWAL(offset, value); err != nil {
+			return fmt.Errorf("failed to write value at offset %d to WAL: %w", offset, err)
+		}
+
+		// Mark this specific version as WAL
+		db.valueCacheMutex.Lock()
+		entry.isWAL = true
+		db.valueCacheMutex.Unlock()
 	}
 
 	return nil
 }
-*/
 
 // flushDirtyIndexPages writes all dirty pages to disk
 // Returns the number of dirty pages that were written to disk
@@ -3459,6 +3922,7 @@ func (db *DB) allocateRadixSubPage() (*RadixSubPage, error) {
 
 		// Check if this page has available sub-pages
 		if radixPage.SubPagesUsed >= SubPagesPerRadixPage {
+			debugPrint("Radix page %d is full, updating to next free page\n", radixPage.pageNumber)
 			// This page is full, update to next free page
 			db.freeRadixPagesHead = radixPage.NextFreePage
 			// Try again recursively
@@ -3769,7 +4233,7 @@ func (db *DB) getRadixSubPage(pageNumber uint32, subPageIdx uint8, maxReadSeq ..
 // ------------------------------------------------------------------------------------------------
 
 // addEntryToNewLeafSubPage creates a new sub-page, adds an entry to it, then search for a leaf page with enough space to insert the sub-page into
-func (db *DB) addEntryToNewLeafSubPage(suffix []byte, dataOffset int64) (*LeafSubPage, error) {
+func (db *DB) addEntryToNewLeafSubPage(suffix []byte, valueOffset int64) (*LeafSubPage, error) {
 
 	// Step 1: Compute the space requirements for the new sub-page
 	suffixLenSize := varint.Size(uint64(len(suffix)))
@@ -3811,7 +4275,7 @@ func (db *DB) addEntryToNewLeafSubPage(suffix []byte, dataOffset int64) (*LeafSu
 	dataPos += len(suffix)
 
 	// Write data offset directly
-	binary.LittleEndian.PutUint64(leafPage.data[dataPos:], uint64(dataOffset))
+	binary.LittleEndian.PutUint64(leafPage.data[dataPos:], uint64(valueOffset))
 
 	// Step 4: Update the leaf page metadata
 	// Update the content size
@@ -3837,7 +4301,7 @@ func (db *DB) addEntryToNewLeafSubPage(suffix []byte, dataOffset int64) (*LeafSu
 }
 
 // addEntryToLeafSubPage adds an entry to a specific leaf sub-page
-func (db *DB) addEntryToLeafSubPage(parentSubPage *RadixSubPage, parentByteValue uint8, subPage *LeafSubPage, suffix []byte, dataOffset int64) error {
+func (db *DB) addEntryToLeafSubPage(parentSubPage *RadixSubPage, parentByteValue uint8, subPage *LeafSubPage, suffix []byte, valueOffset int64) error {
 	leafPage := subPage.Page
 	subPageIdx := subPage.SubPageIdx
 
@@ -3869,13 +4333,13 @@ func (db *DB) addEntryToLeafSubPage(parentSubPage *RadixSubPage, parentByteValue
 		subPageWithHeaderSize := LeafSubPageHeaderSize + newSubPageSize
 		if LeafHeaderSize + subPageWithHeaderSize <= PageSize {
 			// Sub-page can fit in a new leaf page, move it there
-			err := db.moveSubPageToNewLeafPage(subPage, suffix, dataOffset)
+			err := db.moveSubPageToNewLeafPage(subPage, suffix, valueOffset)
 			if err != nil {
 				return fmt.Errorf("failed to move sub-page to new leaf page: %w", err)
 			}
 		} else {
 			// Sub-page is too large even for a new leaf page, convert to radix sub-page
-			err := db.convertLeafSubPageToRadixSubPage(subPage, suffix, dataOffset)
+			err := db.convertLeafSubPageToRadixSubPage(subPage, suffix, valueOffset)
 			if err != nil {
 				return fmt.Errorf("failed to convert leaf sub-page to radix sub-page: %w", err)
 			}
@@ -3910,7 +4374,7 @@ func (db *DB) addEntryToLeafSubPage(parentSubPage *RadixSubPage, parentByteValue
 	entryPos += len(suffix)
 
 	// Write data offset directly
-	binary.LittleEndian.PutUint64(leafPage.data[entryPos:], uint64(dataOffset))
+	binary.LittleEndian.PutUint64(leafPage.data[entryPos:], uint64(valueOffset))
 
 	// Step 4: Update metadata
 	// Update the sub-page size in the header
@@ -3992,7 +4456,7 @@ func (db *DB) removeEntryFromLeafSubPage(subPage *LeafSubPage, entryOffset int, 
 }
 
 // updateEntryInLeafSubPage updates the data offset of an entry in a leaf sub-page
-func (db *DB) updateEntryInLeafSubPage(subPage *LeafSubPage, entryOffset int, entrySize int, dataOffset int64) error {
+func (db *DB) updateEntryInLeafSubPage(subPage *LeafSubPage, entryOffset int, entrySize int, valueOffset int64) error {
 	// Get a writable version of the page
 	leafPage, err := db.getWritablePage(subPage.Page)
 	if err != nil {
@@ -4005,7 +4469,7 @@ func (db *DB) updateEntryInLeafSubPage(subPage *LeafSubPage, entryOffset int, en
 	dataOffsetPosition := entryOffset + entrySize - 8
 
 	// Update the data offset in-place
-	binary.LittleEndian.PutUint64(leafPage.data[dataOffsetPosition:], uint64(dataOffset))
+	binary.LittleEndian.PutUint64(leafPage.data[dataOffsetPosition:], uint64(valueOffset))
 
 	// Mark the page as dirty
 	db.markPageDirty(leafPage)
@@ -4198,29 +4662,23 @@ func (db *DB) convertLeafSubPageToRadixSubPage(subPage *LeafSubPage, newSuffix [
 		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
 	}
 
-	// Allocate a new radix sub-page
-	newRadixSubPage, err := db.allocateRadixSubPage()
-	if err != nil {
-		return fmt.Errorf("failed to allocate radix sub-page: %w", err)
-	}
-
 	// Create a copy of all existing entries from the leaf sub-page
 	var existingEntries []struct {
 		suffix []byte
-		dataOffset int64
+		valueOffset int64
 	}
 
-	err = db.iterateLeafSubPageEntries(leafPage, subPageIdx, func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, dataOffset int64) bool {
+	err := db.iterateLeafSubPageEntries(leafPage, subPageIdx, func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, valueOffset int64) bool {
 		// Get the suffix from the entry (suffixOffset is already relative to leaf page data)
 		suffix := make([]byte, suffixLen)
 		copy(suffix, leafPage.data[suffixOffset:suffixOffset+suffixLen])
 
 		existingEntries = append(existingEntries, struct {
 			suffix []byte
-			dataOffset int64
+			valueOffset int64
 		}{
 			suffix: suffix,
-			dataOffset: dataOffset,
+			valueOffset: valueOffset,
 		})
 		return true // Continue iteration
 	})
@@ -4228,11 +4686,20 @@ func (db *DB) convertLeafSubPageToRadixSubPage(subPage *LeafSubPage, newSuffix [
 		return fmt.Errorf("failed to iterate existing entries: %w", err)
 	}
 
+	// Remove the old sub-page from the leaf page
+	db.removeSubPageFromLeafPage(leafPage, subPageIdx)
+
+	// Allocate a new radix sub-page
+	newRadixSubPage, err := db.allocateRadixSubPage()
+	if err != nil {
+		return fmt.Errorf("failed to allocate radix sub-page: %w", err)
+	}
+
 	// Process all existing entries and add them to the newly created radix sub-page
 	for _, entry := range existingEntries {
 		// Add it to the newly created radix sub-page
 		// The first byte of the suffix determines which branch to take
-		if err := db.setContentOnIndex(newRadixSubPage, entry.suffix, 0, entry.dataOffset); err != nil {
+		if err := db.setContentOnIndex(newRadixSubPage, entry.suffix, 0, entry.valueOffset); err != nil {
 			return fmt.Errorf("failed to convert leaf sub-page to radix sub-page: %w", err)
 		}
 	}
@@ -4241,9 +4708,6 @@ func (db *DB) convertLeafSubPageToRadixSubPage(subPage *LeafSubPage, newSuffix [
 	if err := db.setContentOnIndex(newRadixSubPage, newSuffix, 0, newDataOffset); err != nil {
 		return fmt.Errorf("failed to add new entry to radix sub-page: %w", err)
 	}
-
-	// Remove the old sub-page from the leaf page
-	db.removeSubPageFromLeafPage(leafPage, subPageIdx)
 
 	// Update the sub-page to point to the new radix sub-page
 	subPage.Page = newRadixSubPage.Page
@@ -4544,6 +5008,7 @@ func (db *DB) updateFreeSpaceArray(position int, pageNumber uint32, newFreeSpace
 // Recovery
 // ------------------------------------------------------------------------------------------------
 
+/*
 // recoverUnindexedContent reads the main file starting from the last indexed offset
 // and reindexes any content that hasn't been indexed yet
 // It also checks for commit markers and discards any uncommitted data
@@ -4714,6 +5179,7 @@ func (db *DB) findLastValidCommit(startOffset int64) (int64, error) {
 
 	return lastValidOffset, nil
 }
+*/
 
 // ------------------------------------------------------------------------------------------------
 // System
@@ -4836,6 +5302,8 @@ func (db *DB) startBackgroundWorker() {
 				db.seqMutex.Unlock()
 
 			case "clean":
+				// Discard previous versions of values
+				db.discardOldValueVersions(true)
 				// Discard previous versions of pages
 				numPages := db.discardOldPageVersions(true)
 				// If the number of pages is still greater than the cache size threshold
