@@ -14,8 +14,8 @@ func TestConcurrentAccess(t *testing.T) {
 	dbPath := "test_concurrent.db"
 
 	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	// Open a new database
@@ -25,8 +25,8 @@ func TestConcurrentAccess(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -186,8 +186,8 @@ func TestExclusiveAccess(t *testing.T) {
 	dbPath := "test_exclusive.db"
 
 	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	// Open a new database connection
@@ -197,8 +197,8 @@ func TestExclusiveAccess(t *testing.T) {
 	}
 	defer func() {
 		db1.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -236,8 +236,8 @@ func TestReadOnlyMode(t *testing.T) {
 	dbPath := "test_readonly.db"
 
 	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	// Create and populate the database
@@ -268,8 +268,8 @@ func TestReadOnlyMode(t *testing.T) {
 	}
 	defer func() {
 		readDB.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -308,8 +308,8 @@ func TestReadOnlyMode(t *testing.T) {
 
 func TestTransactionWaitsForPreviousToFinish(t *testing.T) {
 	dbPath := "test_txn_wait.db"
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	db, err := Open(dbPath)
@@ -318,8 +318,8 @@ func TestTransactionWaitsForPreviousToFinish(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 

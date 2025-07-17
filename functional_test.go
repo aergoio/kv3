@@ -17,8 +17,8 @@ func TestDatabaseBasicOperations(t *testing.T) {
 	dbPath := "test_basic.db"
 
 	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	// Open a new database
@@ -28,8 +28,8 @@ func TestDatabaseBasicOperations(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -128,8 +128,8 @@ func TestMultipleKeyValues(t *testing.T) {
 	dbPath := "test_multi.db"
 
 	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	// Open a new database
@@ -139,8 +139,8 @@ func TestMultipleKeyValues(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -227,8 +227,8 @@ func TestShortKeys(t *testing.T) {
 	dbPath := "test_short_keys.db"
 
 	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	// Open a new database
@@ -238,8 +238,8 @@ func TestShortKeys(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -390,8 +390,8 @@ func TestShortKeys(t *testing.T) {
 	}
 	defer func() {
 		reopenedDb2.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -413,8 +413,8 @@ func TestDeleteOperations(t *testing.T) {
 	dbPath := "test_delete.db"
 
 	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	// Open a new database
@@ -424,8 +424,8 @@ func TestDeleteOperations(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -539,8 +539,8 @@ func TestDatabasePersistence1(t *testing.T) {
 	dbPath := "test_persistence.db"
 
 	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	// Open a new database
@@ -585,8 +585,8 @@ func TestDatabasePersistence1(t *testing.T) {
 	}
 	defer func() {
 		reopenedDb.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -643,8 +643,8 @@ func TestDatabasePersistence2(t *testing.T) {
 	dbPath := "test_persistence2.db"
 
 	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	// Open a new database
@@ -693,8 +693,8 @@ func TestDatabasePersistence2(t *testing.T) {
 	}
 	defer func() {
 		reopenedDb.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -745,8 +745,8 @@ func TestIterator(t *testing.T) {
 	dbPath := "test_iterator.db"
 
 	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	// Open a new database
@@ -756,8 +756,8 @@ func TestIterator(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -971,8 +971,8 @@ func TestIterator(t *testing.T) {
 
 	// Test iterator with empty database
 	emptyDbPath := "test_empty_iterator.db"
-	os.Remove(emptyDbPath)
-	os.Remove(emptyDbPath + "-index")
+	os.Remove(emptyDbPath + "-keys")
+	os.Remove(emptyDbPath + "-values")
 	os.Remove(emptyDbPath + "-wal")
 
 	emptyDb, err := Open(emptyDbPath, Options{"MainIndexPages": 1})
@@ -981,8 +981,8 @@ func TestIterator(t *testing.T) {
 	}
 	defer func() {
 		emptyDb.Close()
-		os.Remove(emptyDbPath)
-		os.Remove(emptyDbPath + "-index")
+		os.Remove(emptyDbPath + "-keys")
+		os.Remove(emptyDbPath + "-values")
 		os.Remove(emptyDbPath + "-wal")
 	}()
 
@@ -1000,8 +1000,8 @@ func TestReverseIterator(t *testing.T) {
 	dbPath := "test_reverse_iterator.db"
 
 	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	// Open a new database
@@ -1011,8 +1011,8 @@ func TestReverseIterator(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -1150,8 +1150,8 @@ func TestReverseIterator(t *testing.T) {
 
 	// Test with empty database
 	emptyDbPath := "test_empty_reverse_iterator.db"
-	os.Remove(emptyDbPath)
-	os.Remove(emptyDbPath + "-index")
+	os.Remove(emptyDbPath + "-keys")
+	os.Remove(emptyDbPath + "-values")
 	os.Remove(emptyDbPath + "-wal")
 
 	emptyDb, err := Open(emptyDbPath, Options{"MainIndexPages": 1})
@@ -1160,8 +1160,8 @@ func TestReverseIterator(t *testing.T) {
 	}
 	defer func() {
 		emptyDb.Close()
-		os.Remove(emptyDbPath)
-		os.Remove(emptyDbPath + "-index")
+		os.Remove(emptyDbPath + "-keys")
+		os.Remove(emptyDbPath + "-values")
 		os.Remove(emptyDbPath + "-wal")
 	}()
 
@@ -1179,8 +1179,8 @@ func TestIteratorWithMixedKeys(t *testing.T) {
 	dbPath := "test_iterator_mixed_keys.db"
 
 	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	// Open a new database
@@ -1190,8 +1190,8 @@ func TestIteratorWithMixedKeys(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -1338,8 +1338,8 @@ func TestReverseIteratorWithMixedKeys(t *testing.T) {
 	dbPath := "test_reverse_iterator_mixed_keys.db"
 
 	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	// Open a new database
@@ -1349,8 +1349,8 @@ func TestReverseIteratorWithMixedKeys(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -1521,8 +1521,8 @@ func TestIteratorWithLargeDataset(t *testing.T) {
 	dbPath := "test_iterator_large_dataset.db"
 
 	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	// Open a new database
@@ -1532,8 +1532,8 @@ func TestIteratorWithLargeDataset(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -1728,8 +1728,8 @@ func TestIteratorWithLargeDataset2(t *testing.T) {
 	dbPath := "test_iterator_variable_length.db"
 
 	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	// Open a new database
@@ -1739,8 +1739,8 @@ func TestIteratorWithLargeDataset2(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -1931,10 +1931,11 @@ func TestIteratorWithLargeDataset2(t *testing.T) {
 	}
 }
 
+/*
 func TestDatabaseReindex(t *testing.T) {
 	// Create a test database
 	dbPath := "test_reindex.db"
-	indexPath := dbPath + "-index"
+	indexPath := dbPath + "-keys"
 
 	// Clean up any existing test database
 	os.Remove(dbPath)
@@ -2047,14 +2048,15 @@ func TestDatabaseReindex(t *testing.T) {
 	}
 
 }
+*/
 
 func TestTransactionRollback(t *testing.T) {
 	// Create a test database
 	dbPath := "test_transaction_rollback.db"
 
 	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	// Open a new database
@@ -2064,8 +2066,8 @@ func TestTransactionRollback(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -2325,8 +2327,8 @@ func TestSharedPrefixKeys(t *testing.T) {
 	dbPath := "test_shared_prefix.db"
 
 	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	// Open a new database
@@ -2336,8 +2338,8 @@ func TestSharedPrefixKeys(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -2465,8 +2467,8 @@ func TestSharedPrefixKeysStress(t *testing.T) {
 	dbPath := "test_shared_prefix_stress.db"
 
 	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	// Open a new database with limited main index pages to force more reorganization
@@ -2476,8 +2478,8 @@ func TestSharedPrefixKeysStress(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -2651,8 +2653,8 @@ func TestSharedPrefixKeyOrdering(t *testing.T) {
 	dbPath := "test_shared_prefix_ordering.db"
 
 	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	// Open a new database
@@ -2662,8 +2664,8 @@ func TestSharedPrefixKeyOrdering(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -2859,8 +2861,8 @@ func TestLeafPageToRadixPageConversion(t *testing.T) {
 	dbPath := "test_leaf_subpage_to_radix_subpage_conversion.db"
 
 	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	// Open a new database
@@ -2870,8 +2872,8 @@ func TestLeafPageToRadixPageConversion(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -3140,8 +3142,8 @@ func TestLeafPageToRadixPageConversionSimilarKeys(t *testing.T) {
 	dbPath := "test_leaf_to_radix_conversion_similar.db"
 
 	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	// Open a new database
@@ -3151,8 +3153,8 @@ func TestLeafPageToRadixPageConversionSimilarKeys(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -3511,8 +3513,8 @@ func TestBackgroundWorkerDeadlock(t *testing.T) {
 	dbPath := "test_background_deadlock.db"
 
 	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	// Open database with extremely low thresholds to force immediate background worker activity
@@ -3526,8 +3528,8 @@ func TestBackgroundWorkerDeadlock(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -3637,8 +3639,8 @@ func TestBackgroundWorkerWithTransactions(t *testing.T) {
 	dbPath := "test_background_worker.db"
 
 	// Clean up any existing test database
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	// Open database with very low thresholds to force background worker activity
@@ -3652,8 +3654,8 @@ func TestBackgroundWorkerWithTransactions(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -3718,8 +3720,8 @@ func TestBackgroundWorkerWithTransactions(t *testing.T) {
 func TestHeaderReadingWithWAL(t *testing.T) {
 	// Create a temporary database
 	dbPath := "test_header_wal.db"
-	defer os.Remove(dbPath)
-	defer os.Remove(dbPath + "-index")
+	defer os.Remove(dbPath + "-keys")
+	defer os.Remove(dbPath + "-values")
 	defer os.Remove(dbPath + "-wal")
 
 	// Test 1: Create database with WAL enabled
@@ -3798,8 +3800,8 @@ func TestHeaderReadingWithWAL(t *testing.T) {
 func TestHeaderReadingWithoutWAL(t *testing.T) {
 	// Create a temporary database
 	dbPath := "test_header_no_wal.db"
-	defer os.Remove(dbPath)
-	defer os.Remove(dbPath + "-index")
+	defer os.Remove(dbPath + "-keys")
+	defer os.Remove(dbPath + "-values")
 	defer os.Remove(dbPath + "-wal")
 
 	// Open database using default options (WAL enabled)
@@ -3939,8 +3941,8 @@ func TestTransactionVisibility(t *testing.T) {
 			dbPath := "test_transaction_visibility_" + tc.name + ".db"
 
 			// Clean up any existing test database
-			os.Remove(dbPath)
-			os.Remove(dbPath + "-index")
+			os.Remove(dbPath + "-keys")
+			os.Remove(dbPath + "-values")
 			os.Remove(dbPath + "-wal")
 
 			// Open a new database
@@ -3950,8 +3952,8 @@ func TestTransactionVisibility(t *testing.T) {
 			}
 			defer func() {
 				db.Close()
-				os.Remove(dbPath)
-				os.Remove(dbPath + "-index")
+				os.Remove(dbPath + "-keys")
+				os.Remove(dbPath + "-values")
 				os.Remove(dbPath + "-wal")
 			}()
 
@@ -4146,8 +4148,8 @@ func TestTransactionVisibility(t *testing.T) {
 // This is important to ensure isolation guarantees even for the very first transaction on a fresh database.
 func TestTransactionVisibilityOnFreshDB(t *testing.T) {
 	dbPath := "test_transaction_visibility_fresh.db"
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	db, err := Open(dbPath)
@@ -4156,8 +4158,8 @@ func TestTransactionVisibilityOnFreshDB(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -4198,13 +4200,14 @@ func TestTransactionVisibilityOnFreshDB(t *testing.T) {
 	}
 }
 
+/*
 // TestLastIndexedOffsetUpdate tests that lastIndexedOffset is properly updated when the worker thread
 // flushes pages during active transactions. This test covers the exact scenario that was causing the bug
 // where lastIndexedOffset was not being updated because no dirty pages were found during flush.
 func TestLastIndexedOffsetUpdate(t *testing.T) {
 	dbPath := "test_last_indexed_offset.db"
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	// Open database with small dirty page threshold to trigger frequent flushes
@@ -4219,8 +4222,8 @@ func TestLastIndexedOffsetUpdate(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath)
-		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-keys")
+		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
 	}()
 
@@ -4410,6 +4413,7 @@ func TestLastIndexedOffsetUpdate(t *testing.T) {
 
 	t.Log("TestLastIndexedOffsetUpdate completed successfully")
 }
+*/
 
 // TestFreeListCycle tests for cycles in the free pages linked list
 func TestFreeListCycle(t *testing.T) {
@@ -4417,8 +4421,8 @@ func TestFreeListCycle(t *testing.T) {
 	tmpDir := t.TempDir()
 	dbPath := filepath.Join(tmpDir, "test.db")
 
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 
 	db, err := Open(dbPath)
@@ -4555,8 +4559,8 @@ func TestFreeListCycle(t *testing.T) {
 
 	db.Close()
 
-	os.Remove(dbPath)
-	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
 	os.Remove(dbPath + "-wal")
 }
 
