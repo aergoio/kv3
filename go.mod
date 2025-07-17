@@ -1,4 +1,4 @@
-module github.com/aergoio/kv_log
+module github.com/aergoio/kv3
 
 go 1.23
 

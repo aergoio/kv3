@@ -1,10 +1,9 @@
-package kv_log
+package kv3
 
 import (
 	"bytes"
 	"fmt"
 	"os"
-	"os/exec"
 	"sort"
 	"strings"
 	"testing"

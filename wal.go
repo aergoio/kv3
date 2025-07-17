@@ -1,4 +1,4 @@
-package kv_log
+package kv3
 
 import (
 	"encoding/binary"
@@ -9,7 +9,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/aergoio/kv_log/varint"
+	"github.com/aergoio/kv3/varint"
 )
 
 // WAL constants

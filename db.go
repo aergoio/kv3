@@ -1,4 +1,4 @@
-package kv_log
+package kv3
 
 import (
 	"bytes"
@@ -18,7 +18,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aergoio/kv_log/varint"
+	"github.com/aergoio/kv3/varint"
 )
 
 const (
@@ -237,7 +237,7 @@ var DebugMode bool
 // init initializes package-level variables
 func init() {
 	// Check for debug mode environment variable
-	debugEnv := os.Getenv("KV_LOG_DEBUG")
+	debugEnv := os.Getenv("KV3_DEBUG")
 	// Any non-empty value enables debug mode
 	if debugEnv != "" {
 		DebugMode = true

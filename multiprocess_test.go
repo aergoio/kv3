@@ -1,4 +1,4 @@
-package kv_log
+package kv3
 
 import (
 	"bytes"
@@ -173,12 +173,12 @@ import (
 	"os"
 	"time"
 
-	"github.com/aergoio/kv_log"
+	"github.com/aergoio/kv3"
 )
 
 func main() {
 	// Open the database
-	db, err := kv_log.Open(%q)
+	db, err := kv3.Open(%q)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to open database: %%v\n", err)
 		os.Exit(1)
@@ -224,12 +224,12 @@ import (
 	"os"
 	"time"
 
-	"github.com/aergoio/kv_log"
+	"github.com/aergoio/kv3"
 )
 
 func main() {
 	// Open the database
-	db, err := kv_log.Open(%q)
+	db, err := kv3.Open(%q)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to open database: %%v\n", err)
 		os.Exit(1)
