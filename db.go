@@ -1317,7 +1317,7 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 
 			if entryOffset >= 0 {
 				// Found the entry, read the value
-				return db.readValue(valueOffset)
+				return db.readValue(valueOffset, maxReadSequence)
 			}
 
 			// If we get here, the suffix wasn't found
@@ -1332,7 +1332,7 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	emptySuffixOffset := db.getEmptySuffixOffset(currentSubPage)
 	if emptySuffixOffset > 0 {
 		// Read the value at the offset
-		return db.readValue(emptySuffixOffset)
+		return db.readValue(emptySuffixOffset, maxReadSequence)
 	}
 
 	return nil, fmt.Errorf("key not found")
