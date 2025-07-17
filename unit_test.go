@@ -1968,10 +1968,10 @@ func TestSetOnLeafSubPage(t *testing.T) {
 		keyPos := 4
 		value := []byte("test_value")
 
-		// Mock appendData by writing test data to main file first
-		dataOffset, err = db.appendData(key, value)
+		// Store test data using storeValue
+		dataOffset, err = db.storeValue(value)
 		if err != nil {
-			t.Fatalf("Failed to append test data: %v", err)
+			t.Fatalf("Failed to store test data: %v", err)
 		}
 
 		// Now test setOnLeafSubPage
@@ -2002,15 +2002,12 @@ func TestSetOnLeafSubPage(t *testing.T) {
 		}
 
 		// Verify data can be read back
-		content, err := db.readContent(dataOffset)
+		readValue, err := db.readValue(dataOffset)
 		if err != nil {
-			t.Fatalf("Failed to read content: %v", err)
+			t.Fatalf("Failed to read value: %v", err)
 		}
-		if !bytes.Equal(content.key, key) {
-			t.Errorf("Expected key %v, got %v", key, content.key)
-		}
-		if !bytes.Equal(content.value, value) {
-			t.Errorf("Expected value %v, got %v", value, content.value)
+		if !bytes.Equal(readValue, value) {
+			t.Errorf("Expected value %v, got %v", value, readValue)
 		}
 	})
 
@@ -2033,9 +2030,9 @@ func TestSetOnLeafSubPage(t *testing.T) {
 
 		// Create a leaf sub-page with initial entry using the original value
 		suffix := key[keyPos+1:]
-		originalDataOffset, err := db.appendData(key, originalValue)
+		originalDataOffset, err := db.storeValue(originalValue)
 		if err != nil {
-			t.Fatalf("Failed to append original data: %v", err)
+			t.Fatalf("Failed to store original data: %v", err)
 		}
 
 		leafSubPage, err := db.addEntryToNewLeafSubPage(suffix, originalDataOffset)
@@ -2053,12 +2050,12 @@ func TestSetOnLeafSubPage(t *testing.T) {
 		if !found {
 			t.Fatalf("Expected to find entry at index 0")
 		}
-		originalContent, err := db.readContent(originalDataOffset)
+		originalReadValue, err := db.readValue(originalDataOffset)
 		if err != nil {
-			t.Fatalf("Failed to read original content: %v", err)
+			t.Fatalf("Failed to read original value: %v", err)
 		}
-		if !bytes.Equal(originalContent.value, originalValue) {
-			t.Errorf("Expected original value %v, got %v", originalValue, originalContent.value)
+		if !bytes.Equal(originalReadValue, originalValue) {
+			t.Errorf("Expected original value %v, got %v", originalValue, originalReadValue)
 		}
 
 		// Now update the entry with new value
@@ -2078,12 +2075,12 @@ func TestSetOnLeafSubPage(t *testing.T) {
 		if !found {
 			t.Fatalf("Expected to find entry at index 0")
 		}
-		updatedContent, err := db.readContent(updatedDataOffset)
+		updatedReadValue, err := db.readValue(updatedDataOffset)
 		if err != nil {
-			t.Fatalf("Failed to read updated content: %v", err)
+			t.Fatalf("Failed to read updated value: %v", err)
 		}
-		if !bytes.Equal(updatedContent.value, updatedValue) {
-			t.Errorf("Expected updated value %v, got %v", updatedValue, updatedContent.value)
+		if !bytes.Equal(updatedReadValue, updatedValue) {
+			t.Errorf("Expected updated value %v, got %v", updatedValue, updatedReadValue)
 		}
 
 		// Verify the data offset changed (new data was appended)
@@ -2110,9 +2107,9 @@ func TestSetOnLeafSubPage(t *testing.T) {
 
 		// Create a leaf sub-page with initial entry
 		suffix := key[keyPos+1:]
-		originalDataOffset, err := db.appendData(key, value)
+		originalDataOffset, err := db.storeValue(value)
 		if err != nil {
-			t.Fatalf("Failed to append original data: %v", err)
+			t.Fatalf("Failed to store original data: %v", err)
 		}
 
 		leafSubPage, err := db.addEntryToNewLeafSubPage(suffix, originalDataOffset)
@@ -2126,8 +2123,8 @@ func TestSetOnLeafSubPage(t *testing.T) {
 			t.Fatalf("Expected to find entry at index 0")
 		}
 
-		// Record the main file size before the "update"
-		originalMainFileSize := db.mainFileSize
+		// Record the values file size before the "update"
+		originalValuesFileSize := db.valuesFileSize
 
 		// Now "update" with the same value
 		err = db.setOnLeafSubPage(parentSubPage, leafSubPage, key, keyPos, value, 0)
@@ -2150,9 +2147,9 @@ func TestSetOnLeafSubPage(t *testing.T) {
 			t.Error("Expected data offset to remain the same when updating with same value")
 		}
 
-		// Verify no new data was appended to main file
-		if db.mainFileSize != originalMainFileSize {
-			t.Error("Expected main file size to remain the same when updating with same value")
+		// Verify no new data was appended to values file
+		if db.valuesFileSize != originalValuesFileSize {
+			t.Error("Expected values file size to remain the same when updating with same value")
 		}
 	})
 
@@ -2185,7 +2182,7 @@ func TestSetOnLeafSubPage(t *testing.T) {
 		// Insert all entries
 		for i, testEntry := range testEntries {
 			suffix := testEntry.key[testEntry.keyPos+1:]
-			dataOffset, err := db.appendData(testEntry.key, testEntry.value)
+			dataOffset, err := db.storeValue(testEntry.value)
 			if err != nil {
 				t.Fatalf("Failed to append data for entry %d: %v", i, err)
 			}
@@ -2229,12 +2226,12 @@ func TestSetOnLeafSubPage(t *testing.T) {
 		if !found {
 			t.Fatalf("Expected to find entry at index 0")
 		}
-		content, err := db.readContent(firstDataOffset)
+		content, err := db.readValue(firstDataOffset)
 		if err != nil {
 			t.Fatalf("Failed to read updated content: %v", err)
 		}
-		if !bytes.Equal(content.value, newValue) {
-			t.Errorf("Expected updated value %v, got %v", newValue, content.value)
+		if !bytes.Equal(content, newValue) {
+			t.Errorf("Expected updated value %v, got %v", newValue, content)
 		}
 
 		// Verify other entries remain unchanged
@@ -2243,12 +2240,12 @@ func TestSetOnLeafSubPage(t *testing.T) {
 			if !found {
 				t.Fatalf("Expected to find entry at index %d", i)
 			}
-			content, err := db.readContent(dataOffset)
+			content, err := db.readValue(dataOffset)
 			if err != nil {
 				t.Fatalf("Failed to read content for entry %d: %v", i, err)
 			}
-			if !bytes.Equal(content.value, testEntries[i].value) {
-				t.Errorf("Entry %d value changed unexpectedly: expected %v, got %v", i, testEntries[i].value, content.value)
+			if !bytes.Equal(content, testEntries[i].value) {
+				t.Errorf("Entry %d value changed unexpectedly: expected %v, got %v", i, testEntries[i].value, content)
 			}
 		}
 	})
@@ -2281,7 +2278,7 @@ func TestSetOnLeafSubPage(t *testing.T) {
 		// Insert all entries
 		for i, testEntry := range testEntries {
 			suffix := testEntry.key[testEntry.keyPos+1:]
-			dataOffset, err := db.appendData(testEntry.key, testEntry.value)
+			dataOffset, err := db.storeValue(testEntry.value)
 			if err != nil {
 				t.Fatalf("Failed to append data for entry %d: %v", i, err)
 			}
@@ -2319,12 +2316,12 @@ func TestSetOnLeafSubPage(t *testing.T) {
 		if !found {
 			t.Fatalf("Expected to find entry at index 1")
 		}
-		content, err := db.readContent(middleDataOffset)
+		content, err := db.readValue(middleDataOffset)
 		if err != nil {
 			t.Fatalf("Failed to read updated content: %v", err)
 		}
-		if !bytes.Equal(content.value, newValue) {
-			t.Errorf("Expected updated value %v, got %v", newValue, content.value)
+		if !bytes.Equal(content, newValue) {
+			t.Errorf("Expected updated value %v, got %v", newValue, content)
 		}
 
 		// Verify other entries remain unchanged
@@ -2333,13 +2330,13 @@ func TestSetOnLeafSubPage(t *testing.T) {
 			if !found {
 				t.Fatalf("Expected to find entry at index %d", idx)
 			}
-			content, err := db.readContent(dataOffset)
+			content, err := db.readValue(dataOffset)
 			if err != nil {
 				t.Fatalf("Failed to read content for entry %d: %v", idx, err)
 			}
 			expectedValue := testEntries[idx].value
-			if !bytes.Equal(content.value, expectedValue) {
-				t.Errorf("Entry %d value changed unexpectedly: expected %v, got %v", idx, expectedValue, content.value)
+			if !bytes.Equal(content, expectedValue) {
+				t.Errorf("Entry %d value changed unexpectedly: expected %v, got %v", idx, expectedValue, content)
 			}
 		}
 	})
@@ -2372,7 +2369,7 @@ func TestSetOnLeafSubPage(t *testing.T) {
 		// Insert all entries
 		for i, testEntry := range testEntries {
 			suffix := testEntry.key[testEntry.keyPos+1:]
-			dataOffset, err := db.appendData(testEntry.key, testEntry.value)
+			dataOffset, err := db.storeValue(testEntry.value)
 			if err != nil {
 				t.Fatalf("Failed to append data for entry %d: %v", i, err)
 			}
@@ -2410,12 +2407,12 @@ func TestSetOnLeafSubPage(t *testing.T) {
 		if !found {
 			t.Fatalf("Expected to find entry at index 2")
 		}
-		content, err := db.readContent(lastEntryDataOffset)
+		content, err := db.readValue(lastEntryDataOffset)
 		if err != nil {
 			t.Fatalf("Failed to read updated content: %v", err)
 		}
-		if !bytes.Equal(content.value, newValue) {
-			t.Errorf("Expected updated value %v, got %v", newValue, content.value)
+		if !bytes.Equal(content, newValue) {
+			t.Errorf("Expected updated value %v, got %v", newValue, content)
 		}
 
 		// Verify other entries remain unchanged
@@ -2424,12 +2421,12 @@ func TestSetOnLeafSubPage(t *testing.T) {
 			if !found {
 				t.Fatalf("Expected to find entry at index %d", i)
 			}
-			content, err := db.readContent(dataOffset)
+			content, err := db.readValue(dataOffset)
 			if err != nil {
 				t.Fatalf("Failed to read content for entry %d: %v", i, err)
 			}
-			if !bytes.Equal(content.value, testEntries[i].value) {
-				t.Errorf("Entry %d value changed unexpectedly: expected %v, got %v", i, testEntries[i].value, content.value)
+			if !bytes.Equal(content, testEntries[i].value) {
+				t.Errorf("Entry %d value changed unexpectedly: expected %v, got %v", i, testEntries[i].value, content)
 			}
 		}
 	})
@@ -2462,7 +2459,7 @@ func TestSetOnLeafSubPage(t *testing.T) {
 		// Insert all entries
 		for i, testEntry := range testEntries {
 			suffix := testEntry.key[testEntry.keyPos+1:]
-			dataOffset, err := db.appendData(testEntry.key, testEntry.value)
+			dataOffset, err := db.storeValue(testEntry.value)
 			if err != nil {
 				t.Fatalf("Failed to append data for entry %d: %v", i, err)
 			}
@@ -2507,15 +2504,12 @@ func TestSetOnLeafSubPage(t *testing.T) {
 			if !found {
 				t.Fatalf("Expected to find entry at index %d", i)
 			}
-			content, err := db.readContent(dataOffset)
+			content, err := db.readValue(dataOffset)
 			if err != nil {
 				t.Fatalf("Failed to read content for remaining entry %d: %v", i, err)
 			}
-			if !bytes.Equal(content.key, expectedEntry.key) {
-				t.Errorf("Remaining entry %d key mismatch: expected %v, got %v", i, expectedEntry.key, content.key)
-			}
-			if !bytes.Equal(content.value, expectedEntry.value) {
-				t.Errorf("Remaining entry %d value mismatch: expected %v, got %v", i, expectedEntry.value, content.value)
+			if !bytes.Equal(content, expectedEntry.value) {
+				t.Errorf("Remaining entry %d value mismatch: expected %v, got %v", i, expectedEntry.value, content)
 			}
 		}
 	})
@@ -2548,7 +2542,7 @@ func TestSetOnLeafSubPage(t *testing.T) {
 		// Insert all entries
 		for i, testEntry := range testEntries {
 			suffix := testEntry.key[testEntry.keyPos+1:]
-			dataOffset, err := db.appendData(testEntry.key, testEntry.value)
+			dataOffset, err := db.storeValue(testEntry.value)
 			if err != nil {
 				t.Fatalf("Failed to append data for entry %d: %v", i, err)
 			}
@@ -2595,15 +2589,12 @@ func TestSetOnLeafSubPage(t *testing.T) {
 			if !found {
 				t.Fatalf("Expected to find entry at index %d", i)
 			}
-			content, err := db.readContent(dataOffset)
+			content, err := db.readValue(dataOffset)
 			if err != nil {
 				t.Fatalf("Failed to read content for remaining entry %d: %v", i, err)
 			}
-			if !bytes.Equal(content.key, expectedEntry.key) {
-				t.Errorf("Remaining entry %d key mismatch: expected %v, got %v", i, expectedEntry.key, content.key)
-			}
-			if !bytes.Equal(content.value, expectedEntry.value) {
-				t.Errorf("Remaining entry %d value mismatch: expected %v, got %v", i, expectedEntry.value, content.value)
+			if !bytes.Equal(content, expectedEntry.value) {
+				t.Errorf("Remaining entry %d value mismatch: expected %v, got %v", i, expectedEntry.value, content)
 			}
 		}
 	})
@@ -2636,7 +2627,7 @@ func TestSetOnLeafSubPage(t *testing.T) {
 		// Insert all entries
 		for i, testEntry := range testEntries {
 			suffix := testEntry.key[testEntry.keyPos+1:]
-			dataOffset, err := db.appendData(testEntry.key, testEntry.value)
+			dataOffset, err := db.storeValue(testEntry.value)
 			if err != nil {
 				t.Fatalf("Failed to append data for entry %d: %v", i, err)
 			}
@@ -2674,15 +2665,12 @@ func TestSetOnLeafSubPage(t *testing.T) {
 			if !found {
 				t.Fatalf("Expected to find entry at index %d", i)
 			}
-			content, err := db.readContent(dataOffset)
+			content, err := db.readValue(dataOffset)
 			if err != nil {
 				t.Fatalf("Failed to read content for remaining entry %d: %v", i, err)
 			}
-			if !bytes.Equal(content.key, testEntries[i].key) {
-				t.Errorf("Remaining entry %d key mismatch: expected %v, got %v", i, testEntries[i].key, content.key)
-			}
-			if !bytes.Equal(content.value, testEntries[i].value) {
-				t.Errorf("Remaining entry %d value mismatch: expected %v, got %v", i, testEntries[i].value, content.value)
+			if !bytes.Equal(content, testEntries[i].value) {
+				t.Errorf("Remaining entry %d value mismatch: expected %v, got %v", i, testEntries[i].value, content)
 			}
 		}
 	})
@@ -2733,30 +2721,25 @@ func TestSetOnLeafSubPage(t *testing.T) {
 		newEntryDataOffset := dataOffset
 
 		// Verify data can be read back
-		content, err := db.readContent(newEntryDataOffset)
+		content, err := db.readValue(newEntryDataOffset)
 		if err != nil {
 			t.Fatalf("Failed to read content: %v", err)
 		}
-		if !bytes.Equal(content.key, key) {
-			t.Errorf("Expected key %v, got %v", key, content.key)
-		}
-		if !bytes.Equal(content.value, value) {
-			t.Errorf("Expected value %v, got %v", value, content.value)
+		if !bytes.Equal(content, value) {
+			t.Errorf("Expected value %v, got %v", value, content)
 		}
 	})
 
 	t.Run("DeleteExistingEntryFromSubPage", func(t *testing.T) {
 		// Create proper data offsets by writing to the database
-		keepKey := []byte("prefix_keep_me")
 		keepValue := []byte("keep_value")
-		keepDataOffset, err := db.appendData(keepKey, keepValue)
+		keepDataOffset, err := db.storeValue(keepValue)
 		if err != nil {
 			t.Fatalf("Failed to append keep data: %v", err)
 		}
 
-		deleteKey := []byte("prefix_delete_me")
 		deleteValue := []byte("delete_value")
-		deleteDataOffset, err := db.appendData(deleteKey, deleteValue)
+		deleteDataOffset, err := db.storeValue(deleteValue)
 		if err != nil {
 			t.Fatalf("Failed to append delete data: %v", err)
 		}
@@ -2943,7 +2926,7 @@ func TestPageCacheAfterLeafOperations(t *testing.T) {
 		value := []byte(fmt.Sprintf("test_value_%d", i))
 
 		// Create proper data offsets by writing to the database
-		dataOffset, err := db.appendData(key, value)
+		dataOffset, err := db.storeValue(value)
 		if err != nil {
 			t.Fatalf("Failed to append data for entry %d: %v", i, err)
 		}
@@ -5097,15 +5080,12 @@ func TestEmptySuffixOnRadixPages(t *testing.T) {
 		}
 
 		// Verify we can read the content back
-		content, err := db.readContent(offset)
+		content, err := db.readValue(offset)
 		if err != nil {
 			t.Fatalf("Failed to read content: %v", err)
 		}
-		if !bytes.Equal(content.key, key) {
-			t.Errorf("Expected key %v, got %v", key, content.key)
-		}
-		if !bytes.Equal(content.value, value) {
-			t.Errorf("Expected value %v, got %v", value, content.value)
+		if !bytes.Equal(content, value) {
+			t.Errorf("Expected value %v, got %v", value, content)
 		}
 	})
 
@@ -5142,12 +5122,12 @@ func TestEmptySuffixOnRadixPages(t *testing.T) {
 		}
 
 		// Verify the updated content
-		content, err := db.readContent(updatedOffset)
+		content, err := db.readValue(updatedOffset)
 		if err != nil {
 			t.Fatalf("Failed to read updated content: %v", err)
 		}
-		if !bytes.Equal(content.value, updatedValue) {
-			t.Errorf("Expected updated value %v, got %v", updatedValue, content.value)
+		if !bytes.Equal(content, updatedValue) {
+			t.Errorf("Expected updated value %v, got %v", updatedValue, content)
 		}
 	})
 
@@ -5169,7 +5149,7 @@ func TestEmptySuffixOnRadixPages(t *testing.T) {
 		}
 
 		originalOffset := db.getEmptySuffixOffset(radixSubPage)
-		originalMainFileSize := db.mainFileSize
+		originalValuesFileSize := db.valuesFileSize
 
 		// "Update" with same value
 		err = db.setOnEmptySuffix(radixSubPage, key, value, 0)
@@ -5183,9 +5163,9 @@ func TestEmptySuffixOnRadixPages(t *testing.T) {
 			t.Error("Expected offset to remain the same when updating with same value")
 		}
 
-		// Verify no new data was appended to main file
-		if db.mainFileSize != originalMainFileSize {
-			t.Error("Expected main file size to remain the same when updating with same value")
+		// Verify no new data was appended to values file
+		if db.valuesFileSize != originalValuesFileSize {
+			t.Error("Expected values file size to remain the same when updating with same value")
 		}
 	})
 
@@ -5275,6 +5255,7 @@ func TestEmptySuffixOnRadixPages(t *testing.T) {
 }
 
 // TestFindLastValidCommit tests the findLastValidCommit function
+/* TestFindLastValidCommit tests main file functionality that was removed
 func TestFindLastValidCommit(t *testing.T) {
 	// Helper function to create test content
 	createTestContent := func(key, value []byte) []byte {
@@ -5509,8 +5490,9 @@ func TestFindLastValidCommit(t *testing.T) {
 		}
 	})
 }
+*/
 
-// TestRecoverUnindexedContent tests the recoverUnindexedContent function
+/* TestRecoverUnindexedContent tests main file functionality that was removed
 func TestRecoverUnindexedContent(t *testing.T) {
 	t.Run("NoUnindexedContent", func(t *testing.T) {
 		// Create a test database
@@ -5614,7 +5596,7 @@ func TestRecoverUnindexedContent(t *testing.T) {
 
 		// Manually append uncommitted data to the main file
 		db.beginTransaction()
-		_, err = db.appendData([]byte("key2"), []byte("value2"))
+		_, err = db.storeValue([]byte("value2"))
 		if err != nil {
 			t.Fatalf("Failed to append data: %v", err)
 		}
@@ -5875,6 +5857,7 @@ func TestRecoverUnindexedContent(t *testing.T) {
 		}
 	})
 }
+*/
 
 // TestWriteRadixPage tests the writeRadixPage function
 func TestWriteRadixPage(t *testing.T) {
