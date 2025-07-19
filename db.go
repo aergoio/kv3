@@ -278,7 +278,7 @@ func Open(path string, options ...Options) (*DB, error) {
 	writeMode := WorkerThread_WAL // Default to use WAL in a background thread
 	cacheSizeThreshold := calculateDefaultCacheSize()  // Calculate based on system memory
 	dirtyPageThreshold := cacheSizeThreshold / 2       // Default to 50% of cache size
-	checkpointThreshold := int64(1024 * 1024)          // Default to 1MB
+	checkpointThreshold := int64(1024 * 1024 * 100)    // Default to 100MB
 
 	// Parse options
 	var opts Options
@@ -298,7 +298,6 @@ func Open(path string, options ...Options) (*DB, error) {
 				readOnly = ro
 			}
 		}
-		/*
 		if val, ok := opts["WriteMode"]; ok {
 			if jm, ok := val.(string); ok {
 				if jm == CallerThread_WAL_Sync || jm == CallerThread_WAL_NoSync || jm == WorkerThread_WAL || jm == WorkerThread_NoWAL || jm == WorkerThread_NoWAL_NoSync {
@@ -308,7 +307,6 @@ func Open(path string, options ...Options) (*DB, error) {
 				}
 			}
 		}
-		*/
 		if val, ok := opts["CacheSizeThreshold"]; ok {
 			if cst, ok := val.(int); ok && cst > 0 {
 				cacheSizeThreshold = cst
@@ -644,6 +642,11 @@ func (db *DB) Close() error {
 		return nil // Already closed
 	}
 
+	if db.isClosing {
+		return nil // Already closing
+	}
+	db.isClosing = true
+
 	if !db.readOnly {
 		// If there's an open transaction, rollback before closing
 		if db.inTransaction {
@@ -666,7 +669,7 @@ func (db *DB) Close() error {
 			close(db.workerChannel)
 		} else {
 			// Flush the index to disk
-			flushErr = db.flushIndexToDisk()
+			flushErr = db.flushIndexToDisk(true)
 		}
 	}
 
@@ -1285,7 +1288,7 @@ func (db *DB) initializeIndexFile() error {
 	}
 
 	// Flush the index to disk
-	//if err := db.flushIndexToDisk(); err != nil {
+	//if err := db.flushIndexToDisk(true); err != nil {
 	//	return fmt.Errorf("failed to flush index to disk: %w", err)
 	//}
 
@@ -2393,7 +2396,7 @@ func (db *DB) Sync() error {
 	}
 
 	// Flush the index to disk
-	if err := db.flushIndexToDisk(); err != nil {
+	if err := db.flushIndexToDisk(true); err != nil {
 		return fmt.Errorf("failed to flush index to disk: %w", err)
 	}
 
@@ -2603,8 +2606,6 @@ func (db *DB) beginTransaction() {
 func (db *DB) commitTransaction() {
 	debugPrint("Committing transaction %d\n", db.txnSequence)
 
-	// TODO: Implement commit marker
-
 	// Release transaction lock if it was acquired for this transaction
 	if db.lockAcquiredForTransaction {
 		if err := db.releaseWriteLock(db.originalLockType); err != nil {
@@ -2617,9 +2618,10 @@ func (db *DB) commitTransaction() {
 	db.inTransaction = false
 	db.seqMutex.Unlock()
 
-	// If using WAL and in caller thread mode, flush to disk
-	if db.useWAL && db.commitMode == CallerThread {
-		db.flushIndexToDisk()
+	// If the commit should be made by the caller thread
+	if db.commitMode == CallerThread {
+		// Flush the transaction changes to disk
+		db.flushIndexToDisk(true)
 	}
 }
 
@@ -2659,13 +2661,6 @@ func (db *DB) rollbackTransaction() {
 	db.seqMutex.Lock()
 	db.inTransaction = false
 	db.seqMutex.Unlock()
-
-	// It could use an optimistic approach:
-	// - do not clone pages for new transactions, only if there is a flush happening
-	// on rollback:
-	// - truncate the main db file to the stored size before the transaction started
-	// - discard all dirty pages
-	// - rebuild the index pages from the main db file (incremental reindexing)
 
 }
 
@@ -2835,7 +2830,7 @@ func (db *DB) checkPageCache(isWrite bool) {
 		// Check which thread should flush the pages
 		if db.commitMode == CallerThread {
 			// Write the pages to the WAL file
-			db.flushIndexToDisk()
+			db.flushIndexToDisk(true)
 		} else {
 			// Signal the worker thread to flush the pages, if not already signaled
 			db.seqMutex.Lock()
@@ -3371,7 +3366,7 @@ func (db *DB) GetCacheStats() map[string]interface{} {
 }
 
 // flushIndexToDisk flushes all dirty pages to disk and writes the index header
-func (db *DB) flushIndexToDisk() error {
+func (db *DB) flushIndexToDisk(isCallerThread bool) error {
 	// Check if file is opened in read-only mode
 	if db.readOnly {
 		return fmt.Errorf("cannot flush index to disk: database opened in read-only mode")
@@ -3385,6 +3380,8 @@ func (db *DB) flushIndexToDisk() error {
 		db.flushSequence = db.txnSequence
 	}
 	db.seqMutex.Unlock()
+
+	debugPrint("Flushing index to disk. Flush sequence: %d, Transaction sequence: %d\n", db.flushSequence, db.txnSequence)
 
 	// Flush values to WAL first (if using WAL)
 	if db.useWAL {
@@ -3411,7 +3408,7 @@ func (db *DB) flushIndexToDisk() error {
 
 	// Commit the transaction if using WAL
 	if db.useWAL {
-		if err := db.walCommit(); err != nil {
+		if err := db.walCommit(isCallerThread); err != nil {
 			return fmt.Errorf("failed to commit WAL: %w", err)
 		}
 	}
@@ -4774,7 +4771,7 @@ func (db *DB) recoverUnindexedContent() error {
 
 	if !db.readOnly {
 		// Flush the index pages to disk
-		if err := db.flushIndexToDisk(); err != nil {
+		if err := db.flushIndexToDisk(true); err != nil {
 			return fmt.Errorf("failed to flush index to disk: %w", err)
 		}
 	}
@@ -5003,7 +5000,7 @@ func (db *DB) startBackgroundWorker() {
 			switch cmd {
 
 			case "flush":
-				db.flushIndexToDisk()
+				db.flushIndexToDisk(false)
 				// Clear the pending command flag
 				db.seqMutex.Lock()
 				delete(db.pendingCommands, "flush")

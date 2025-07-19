@@ -662,7 +662,7 @@ func (db *DB) scanWAL() error {
 }
 
 // walCommit writes a commit record to the WAL file
-func (db *DB) walCommit() error {
+func (db *DB) walCommit(isCallerThread bool) error {
 	// If WAL info is not initialized, return
 	if db.walInfo == nil {
 		return nil
@@ -691,21 +691,22 @@ func (db *DB) walCommit() error {
 		}
 	}
 
-	// Clean up old page versions from cache after successful commit
-	db.discardOldPageVersions(true)
-	// Discard previous versions of values
-	db.discardOldValueVersions(true)
-
 	// Update sequence number after successful commit
 	db.walInfo.lastCommitSequence = db.txnSequence
 
 	// Check if it should run a checkpoint
-	if db.shouldCheckpoint() {
+	if db.shouldCheckpoint(isCallerThread) {
 		// Checkpoint the WAL file into the index file
 		if err := db.checkpointWAL(); err != nil {
 			// Log error but don't fail the commit
 			debugPrint("Checkpoint failed: %v", err)
 		}
+	// If the commit is made by the main thread, clean up the cache
+	} else if db.commitMode == CallerThread {
+		// Clean up old page versions from cache
+		db.discardOldPageVersions(true)
+		// Discard previous versions of values
+		db.discardOldValueVersions(true)
 	}
 
 	return nil
@@ -741,7 +742,17 @@ func (db *DB) walRollback() error {
 */
 
 // shouldCheckpoint checks if the WAL file should be checkpointed
-func (db *DB) shouldCheckpoint() bool {
+func (db *DB) shouldCheckpoint(isCallerThread bool) bool {
+	// If the database is closing, don't checkpoint
+	if db.isClosing {
+		return false
+	}
+
+	// If the commit is made by the main thread, only checkpoint if the commit mode is CallerThread
+	if isCallerThread && db.commitMode != CallerThread {
+		return false
+	}
+
 	// Check WAL file size
 	walFileInfo, err := db.walInfo.file.Stat()
 	if err == nil {
@@ -758,6 +769,8 @@ func (db *DB) checkpointWAL() error {
 	if db.walInfo == nil {
 		return nil
 	}
+
+	debugPrint("Checkpoint WAL. Last commit sequence: %d\n", db.walInfo.lastCommitSequence)
 
 	// Lock the cache during checkpoint
 	//db.walInfo.cacheMutex.Lock()
@@ -778,11 +791,10 @@ func (db *DB) checkpointWAL() error {
 		return fmt.Errorf("failed to copy pages to index file: %w", err)
 	}
 
-	// Sync the values file to ensure all changes are persisted
+	// Sync the destination files to ensure all changes are persisted
 	if err := db.valuesFile.Sync(); err != nil {
 		return fmt.Errorf("failed to sync values file after checkpoint: %w", err)
 	}
-	// Sync the index file to ensure all changes are persisted
 	if err := db.indexFile.Sync(); err != nil {
 		return fmt.Errorf("failed to sync index file after checkpoint: %w", err)
 	}
