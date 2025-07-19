@@ -161,6 +161,7 @@ type DB struct {
 
 	// Add a condition variable for transaction waiting
 	transactionCond *sync.Cond
+	isClosing bool // Whether the database is closing
 }
 
 // Transaction represents a database transaction
@@ -2715,24 +2716,24 @@ func (db *DB) getFromCache(pageNumber uint32) (*Page, bool) {
 // getPageAndCall gets a page from the cache and calls a callback/lambda function with the page while the lock is held
 func (db *DB) getPageAndCall(pageNumber uint32, callback func(*cacheBucket, uint32, *Page)) {
 	bucket := &db.pageCache[pageNumber & 1023]
-	bucket.mutex.RLock()
+	bucket.mutex.Lock()
 	page, exists := bucket.pages[pageNumber]
 	if exists {
 		callback(bucket, pageNumber, page)
 	}
-	bucket.mutex.RUnlock()
+	bucket.mutex.Unlock()
 }
 
 // iteratePages iterates through all pages in the cache and calls a callback/lambda function with the page while the lock is held
 func (db *DB) iteratePages(callback func(*cacheBucket, uint32, *Page)) {
 	for bucketIdx := 0; bucketIdx < 1024; bucketIdx++ {
 		bucket := &db.pageCache[bucketIdx]
-		bucket.mutex.RLock()
+		bucket.mutex.Lock()
 		// Iterate through all pages in this bucket
 		for pageNumber, page := range bucket.pages {
 			callback(bucket, pageNumber, page)
 		}
-		bucket.mutex.RUnlock()
+		bucket.mutex.Unlock()
 	}
 }
 
@@ -3444,9 +3445,11 @@ func (db *DB) flushValuesToWAL() error {
 		return offsets[i] < offsets[j]
 	})
 
+	db.valueCacheMutex.RLock()
+	defer db.valueCacheMutex.RUnlock()
+
 	// Write each value to WAL in order
 	for _, offset := range offsets {
-		db.valueCacheMutex.Lock()
 		entry := db.valueCache[offset]
 
 		// Find the correct version to flush (up to flush sequence)
@@ -3457,12 +3460,10 @@ func (db *DB) flushValuesToWAL() error {
 		}
 
 		if entry == nil || entry.isWAL {
-			db.valueCacheMutex.Unlock()
 			continue
 		}
 
 		value := entry.value
-		db.valueCacheMutex.Unlock()
 
 		// Write to WAL
 		if err := db.writeValueToWAL(offset, value); err != nil {
@@ -3470,9 +3471,7 @@ func (db *DB) flushValuesToWAL() error {
 		}
 
 		// Mark this specific version as WAL
-		db.valueCacheMutex.Lock()
 		entry.isWAL = true
-		db.valueCacheMutex.Unlock()
 	}
 
 	return nil
