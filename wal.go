@@ -289,8 +289,14 @@ func (db *DB) writePageFrame(pageNumber uint32, pageData []byte) error {
 
 // writeValueFrame writes a value frame to the WAL file
 func (db *DB) writeValueFrame(offset int64, value []byte) error {
-	// Prepare the value data with type, size, and value
-	valueData := prepareValueData(value)
+	var valueData []byte
+	if offset == FreeValuesListOffset {
+		// use the raw value data
+		valueData = value
+	} else {
+		// Prepare the value data with type, size, and value
+		valueData = prepareValueData(value)
+	}
 
 	// Write the frame header with the total segment size in the identifier field
 	frameOffset, err := db.writeFrameHeader(WalFrameTypeValue, uint32(len(valueData)), offset, valueData)
@@ -560,7 +566,10 @@ func (db *DB) scanWAL() error {
 
 			// Extract the actual value based on type
 			var actualValue []byte
-			if valueType == 'F' {
+			if valueOffset == FreeValuesListOffset {
+				// use the raw value data
+				actualValue = segment
+			} else if valueType == 'F' {
 				// Deleted value - store as nil
 				actualValue = nil
 			} else if valueType == 'V' {
@@ -859,10 +868,6 @@ func (db *DB) copyPagesToIndexFile(localCache localCache, commitSequence int64) 
 
 // copyValuesToValuesFile copies values from the value cache to the values file
 func (db *DB) copyValuesToValuesFile(commitSequence int64) error {
-	if db.walInfo == nil {
-		return nil
-	}
-
 	var offsets []int64
 
 	// Get all values with the specified commit sequence
@@ -899,8 +904,14 @@ func (db *DB) copyValuesToValuesFile(commitSequence int64) error {
 			continue // Entry not found for this commit sequence
 		}
 
-		// Prepare the value data with type, size, and value
-		valueData := prepareValueData(entry.value)
+		var valueData []byte
+		if offset == FreeValuesListOffset {
+			// use the raw value data
+			valueData = entry.value
+		} else {
+			// Prepare the value data with type, size, and value
+			valueData = prepareValueData(entry.value)
+		}
 
 		// Write the value data to the values file
 		if _, err := db.valuesFile.WriteAt(valueData, offset); err != nil {
@@ -999,9 +1010,9 @@ func (db *DB) copyWALPagesToIndexFile() error {
 
 // copyWALValuesToValuesFile copies values from the WAL cache to the values file
 func (db *DB) copyWALValuesToValuesFile() error {
+	var valueOffsets []int64
 
 	// Copy values
-	var valueOffsets []int64
 	db.valueCacheMutex.RLock()
 	for offset, entry := range db.valueCache {
 		// Find the first WAL version
@@ -1035,8 +1046,14 @@ func (db *DB) copyWALValuesToValuesFile() error {
 			continue // No WAL entry found
 		}
 
-		// Prepare the value data with type, size, and value
-		valueData := prepareValueData(entry.value)
+		var valueData []byte
+		if offset == FreeValuesListOffset {
+			// use the raw value data
+			valueData = entry.value
+		} else {
+			// Prepare the value data with type, size, and value
+			valueData = prepareValueData(entry.value)
+		}
 
 		// Write the value data to the values file
 		if _, err := db.valuesFile.WriteAt(valueData, offset); err != nil {

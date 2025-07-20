@@ -2082,11 +2082,6 @@ func TestSetOnLeafSubPage(t *testing.T) {
 		if !bytes.Equal(updatedReadValue, updatedValue) {
 			t.Errorf("Expected updated value %v, got %v", updatedValue, updatedReadValue)
 		}
-
-		// Verify the data offset changed (new data was appended)
-		if originalDataOffset == updatedDataOffset {
-			t.Error("Expected data offset to change after update")
-		}
 	})
 
 	t.Run("UpdateWithSameValue", func(t *testing.T) {

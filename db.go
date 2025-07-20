@@ -52,7 +52,13 @@ const (
 	// Leaf sub-page header size
 	LeafSubPageHeaderSize = 3 // SubPageID(1) + SubPageSize(2)
 	// Minimum free space in bytes required to add a leaf page to the free space array
-	MIN_FREE_SPACE = 64
+	MIN_LEAF_FREE_SPACE = 64
+	// Maximum number of free space entries in the array
+	MaxFreeSpaceEntries = 500 // Maximum number of free space entries in the array
+	// Maximum number of free value entries in the array
+	MaxFreeValueEntries = 508 // Maximum number of free value entries (4064 / 8 = 508)
+	// Offset in values file where free values list is stored
+	FreeValuesListOffset = 32 // Offset 32 in values file header
 )
 
 // Content types
@@ -91,15 +97,16 @@ const (
 	SyncOff = 0 // Don't sync after writes
 )
 
-// Free space tracking
-const (
-	MaxFreeSpaceEntries = 500 // Maximum number of free space entries in the array
-)
-
 // FreeSpaceEntry represents an entry in the free space array
 type FreeSpaceEntry struct {
 	PageNumber uint32 // Page number of the leaf page
 	FreeSpace  uint16 // Amount of free space in bytes
+}
+
+// FreeValueEntry represents a free value slot in the values file
+type FreeValueEntry struct {
+	Offset int64  // File offset of the free value
+	Size   uint32 // Size of the free value in bytes
 }
 
 // ValueEntry represents a value entry in the value cache
@@ -162,6 +169,10 @@ type DB struct {
 	// Add a condition variable for transaction waiting
 	transactionCond *sync.Cond
 	isClosing bool // Whether the database is closing
+
+	// Free values list management
+	freeValues []FreeValueEntry // In-memory array of free value entries with size info
+	freeValuesChanged bool // Whether the free values list has been modified
 }
 
 // Transaction represents a database transaction
@@ -394,6 +405,7 @@ func Open(path string, options ...Options) (*DB, error) {
 		workerChannel:      make(chan string, 10), // Buffer size of 10 for commands
 		pendingCommands:    make(map[string]bool), // Initialize the pending commands map
 		valueCache:         make(map[int64]*ValueEntry), // Initialize the value cache
+		freeValues:         make([]FreeValueEntry, 0, MaxFreeValueEntries), // Initialize free values list
 	}
 
 	// Initialize each bucket's map
@@ -1246,8 +1258,6 @@ func (db *DB) initialize() error {
 	return nil
 }
 
-
-
 // initializeIndexFile initializes the index file
 func (db *DB) initializeIndexFile() error {
 
@@ -1310,7 +1320,8 @@ func (db *DB) initializeValuesFile() error {
 	// Write the 8-byte database ID
 	binary.LittleEndian.PutUint64(header[8:16], db.databaseID)
 
-	// The rest of the header is reserved for future use
+	// Bytes 16-32 are reserved for future use
+	// Bytes 32-4096 are used for the free values list
 
 	debugPrint("Writing values file header to disk\n")
 	// Write the header to the file
@@ -1320,6 +1331,10 @@ func (db *DB) initializeValuesFile() error {
 
 	// Update file size to include the header
 	db.valuesFileSize = PageSize
+
+	// Initialize empty free values list
+	db.freeValues = make([]FreeValueEntry, 0, MaxFreeValueEntries)
+	db.freeValuesChanged = false
 
 	return nil
 }
@@ -1350,6 +1365,9 @@ func (db *DB) readHeader() error {
 	if err := db.readIndexFileHeader(true); err != nil {
 		return fmt.Errorf("failed to read index file header from WAL: %w", err)
 	}
+
+	// Read the free values list from WAL/cache now that WAL is available
+	db.readFreeValuesFromWAL()
 
 	// Preload the first two levels of the radix tree
 	if err := db.preloadRadixLevels(); err != nil {
@@ -1463,6 +1481,13 @@ func (db *DB) readValuesFileHeader() error {
 	// Ensure values file size is at least PageSize to account for header
 	if db.valuesFileSize < PageSize {
 		db.valuesFileSize = PageSize
+	}
+
+	// Read the free values list from the file (will be updated later from WAL if available)
+	if err := db.readFreeValuesFromFile(); err != nil {
+		debugPrint("Failed to read free values list: %v\n", err)
+		// Initialize empty array if reading fails
+		db.freeValues = make([]FreeValueEntry, 0, MaxFreeValueEntries)
 	}
 
 	return nil
@@ -1795,7 +1820,9 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 // If existingOffset is provided and the new value fits in the same space, it reuses the offset
 // Otherwise, it appends to the end of the values file (starting from PageSize to account for header)
 func (db *DB) storeValue(value []byte, existingOffset ...int64) (int64, error) {
-	/*
+	// Calculate the size needed for the new value
+	newValueSize := uint32(1 + varint.Size(uint64(len(value))) + len(value)) // 1 byte for type ('V')
+
 	// Check if we should try to reuse an existing offset
 	if len(existingOffset) > 0 && existingOffset[0] > 0 {
 		// Try to reuse the existing offset if the value fits
@@ -1803,29 +1830,46 @@ func (db *DB) storeValue(value []byte, existingOffset ...int64) (int64, error) {
 		existingEntry, exists := db.valueCache[existingOffset[0]]
 		db.valueCacheMutex.RUnlock()
 
-		if exists {
-			// Calculate the size needed for the new value
-			newValueSize := varint.Size(uint64(len(value))) + len(value)
-			existingValueSize := varint.Size(uint64(len(existingEntry.value))) + len(existingEntry.value)
+		if exists && existingEntry.value != nil {
+			// Calculate the size of the existing value
+			existingValueSize := uint32(varint.Size(uint64(len(existingEntry.value))) + len(existingEntry.value) + 1)
 
 			// If the new value fits in the same space, reuse the offset
 			if newValueSize <= existingValueSize {
 				// Update the value in the cache with versioning
 				db.valueCacheMutex.Lock()
-				currentEntry := db.valueCache[existingOffset[0]]
 				newEntry := &ValueEntry{
 					value:       value,
 					txnSequence: db.txnSequence,
 					isWAL:       false,
-					next:        currentEntry, // Link to previous version
+					next:        existingEntry, // Link to previous version
 				}
 				db.valueCache[existingOffset[0]] = newEntry
 				db.valueCacheMutex.Unlock()
+
+				debugPrint("Reused existing offset %d for value, size %d\n", existingOffset[0], newValueSize)
 				return existingOffset[0], nil
 			}
 		}
 	}
-	*/
+
+	// Try to find a suitable free space
+	if freeOffset := db.findFreeValueSpace(newValueSize); freeOffset > 0 {
+		// Store the value in the cache with versioning support
+		db.valueCacheMutex.Lock()
+		existingEntry := db.valueCache[freeOffset]
+		newEntry := &ValueEntry{
+			value:       value,
+			txnSequence: db.txnSequence,
+			isWAL:       false,
+			next:        existingEntry, // Link to previous version if it exists
+		}
+		db.valueCache[freeOffset] = newEntry
+		db.valueCacheMutex.Unlock()
+
+		debugPrint("Reused free space at offset %d for value, size %d\n", freeOffset, newValueSize)
+		return freeOffset, nil
+	}
 
 	// Allocate a new offset at the end of the values file
 	// Ensure we start from PageSize (4096) if the file only contains header
@@ -1835,8 +1879,7 @@ func (db *DB) storeValue(value []byte, existingOffset ...int64) (int64, error) {
 	}
 
 	// Update the values file size
-	valueSize := varint.Size(uint64(len(value))) + len(value) + 1 // 1 byte for type ('V')
-	db.valuesFileSize = offset + int64(valueSize)
+	db.valuesFileSize = offset + int64(newValueSize)
 
 	// Store the value in the cache with versioning support
 	db.valueCacheMutex.Lock()
@@ -1850,12 +1893,40 @@ func (db *DB) storeValue(value []byte, existingOffset ...int64) (int64, error) {
 	db.valueCache[offset] = newEntry
 	db.valueCacheMutex.Unlock()
 
-	debugPrint("Stored value at offset %d, size %d\n", offset, valueSize)
+	debugPrint("Stored value at new offset %d, size %d\n", offset, newValueSize)
 	return offset, nil
 }
 
 // deleteValue marks a value as deleted by changing its type from 'V' to 'F'
 func (db *DB) deleteValue(offset int64) error {
+	// First, get the size of the value being deleted
+	var valueSize uint32
+
+	// Try to get size from cache first
+	db.valueCacheMutex.RLock()
+	if entry, exists := db.valueCache[offset]; exists && entry.value != nil {
+		// Calculate total size: type(1) + varint size + value size
+		valueSize = uint32(1 + varint.Size(uint64(len(entry.value))) + len(entry.value))
+	}
+	db.valueCacheMutex.RUnlock()
+
+	// If not in cache, read from file to get size
+	if valueSize == 0 {
+		if offset >= PageSize && offset < db.valuesFileSize {
+			// Read the type byte
+			typeBuf := make([]byte, 1)
+			if _, err := db.valuesFile.ReadAt(typeBuf, offset); err == nil && typeBuf[0] == 'V' {
+				// Read the value size
+				sizeBuf := make([]byte, 10) // Enough for varint
+				if _, err := db.valuesFile.ReadAt(sizeBuf, offset+1); err == nil {
+					if storedSize, bytesRead := varint.Read(sizeBuf); bytesRead > 0 {
+						valueSize = uint32(1 + bytesRead + int(storedSize))
+					}
+				}
+			}
+		}
+	}
+
 	// Mark as deleted by storing an empty value with versioning
 	db.valueCacheMutex.Lock()
 	currentEntry := db.valueCache[offset]
@@ -1868,7 +1939,12 @@ func (db *DB) deleteValue(offset int64) error {
 	db.valueCache[offset] = newEntry
 	db.valueCacheMutex.Unlock()
 
-	debugPrint("Marked value at offset %d as deleted\n", offset)
+	// Add to free values list if we got a valid size
+	if valueSize > 0 {
+		db.addToFreeValuesList(offset, valueSize)
+	}
+
+	debugPrint("Marked value at offset %d as deleted (size: %d)\n", offset, valueSize)
 	return nil
 }
 
@@ -1935,7 +2011,7 @@ func (db *DB) readValue(offset int64, maxReadSeq ...int64) ([]byte, error) {
 
 	// For unknown types, return an error
 	if valueType != 'V' {
-		return nil, fmt.Errorf("unknown value type: %c", valueType)
+		return nil, fmt.Errorf("unknown value type: %c (byte value: %d) at offset %d", valueType, valueType, offset)
 	}
 
 	// Read the value size
@@ -1958,6 +2034,286 @@ func (db *DB) readValue(offset int64, maxReadSeq ...int64) ([]byte, error) {
 	}
 
 	return valueData, nil
+}
+
+// findFreeValueSpace finds a suitable free space for a value of the given size
+func (db *DB) findFreeValueSpace(neededSize uint32) int64 {
+	// Find the smallest free space that can fit the needed size
+	bestIndex := -1
+	var bestSize uint32 = 0
+
+	for i, entry := range db.freeValues {
+		if entry.Size >= neededSize {
+			if bestIndex == -1 || entry.Size < bestSize {
+				bestIndex = i
+				bestSize = entry.Size
+			}
+		}
+	}
+
+	if bestIndex >= 0 {
+		freeOffset := db.freeValues[bestIndex].Offset
+
+		// Mark the entry as used
+		db.freeValues[bestIndex].Offset = 0
+		db.freeValues[bestIndex].Size = 0
+		db.freeValuesChanged = true
+
+		return freeOffset
+	}
+
+	return 0 // No suitable free space found
+}
+
+// addToFreeValuesList adds a deleted value to the free values list
+func (db *DB) addToFreeValuesList(offset int64, size uint32) {
+	// Create a new entry
+	newEntry := FreeValueEntry{
+		Offset: offset,
+		Size:   size,
+	}
+
+	// First, try to find an empty slot to reuse
+	for i := 0; i < len(db.freeValues); i++ {
+		if db.freeValues[i].Offset == 0 {
+			db.freeValues[i] = newEntry
+			db.freeValuesChanged = true
+			debugPrint("Reused slot %d for offset %d (size %d) in free values list\n", i, offset, size)
+			return
+		}
+	}
+
+	// If array has space, just add the entry
+	if len(db.freeValues) < MaxFreeValueEntries {
+		db.freeValues = append(db.freeValues, newEntry)
+		db.freeValuesChanged = true
+		debugPrint("Added offset %d (size %d) to free values list\n", offset, size)
+		return
+	}
+
+	// Array is full, find the smallest entry and replace it if the new entry is larger
+	minIndex := -1
+	minSize := size // Only replace if existing entry is smaller
+
+	for i := 0; i < len(db.freeValues); i++ {
+		if db.freeValues[i].Offset != 0 && db.freeValues[i].Size < minSize {
+			minIndex = i
+			minSize = db.freeValues[i].Size
+		}
+	}
+
+	// Only add if we found a smaller entry to replace
+	if minIndex >= 0 {
+		db.freeValues[minIndex] = newEntry
+		db.freeValuesChanged = true
+		debugPrint("Replaced smallest entry at slot %d with offset %d (size %d) in free values list\n", minIndex, offset, size)
+	} else {
+		debugPrint("Free values list full, skipped offset %d (size %d)\n", offset, size)
+	}
+}
+
+// writeFreeValuesArray writes the free values list to the values cache
+func (db *DB) writeFreeValuesArray() error {
+	// Prepare buffer with all zeros
+	maxBytes := MaxFreeValueEntries * 8
+	buffer := make([]byte, maxBytes)
+
+	// Write each offset (only the offset, not the size)
+	for i, entry := range db.freeValues {
+		if i >= MaxFreeValueEntries {
+			break
+		}
+		binary.LittleEndian.PutUint64(buffer[i*8:(i+1)*8], uint64(entry.Offset))
+	}
+
+	// Assert that the write does not exceed the header size
+	if FreeValuesListOffset + len(buffer) > PageSize {
+		return fmt.Errorf("free values list write exceeds header size")
+	}
+
+	// Store the free values list in the value cache
+	// The offset 32 is located in the values file header
+	db.valueCacheMutex.Lock()
+	existingEntry := db.valueCache[FreeValuesListOffset]
+	freeValuesEntry := &ValueEntry{
+		value:       buffer,
+		txnSequence: db.txnSequence,
+		isWAL:       false,
+		next:        existingEntry,
+	}
+	db.valueCache[FreeValuesListOffset] = freeValuesEntry
+	db.valueCacheMutex.Unlock()
+
+	if DebugMode {
+		// Count non-zero entries
+		nonZeroCount := 0
+		for _, entry := range db.freeValues {
+			if entry.Offset != 0 {
+				nonZeroCount++
+			}
+		}
+		debugPrint("Wrote %d non-zero free values to cache (total slots: %d)\n", nonZeroCount, len(db.freeValues))
+	}
+
+	return nil
+}
+
+// readFreeValuesFromFile reads the free values list from the values file header
+func (db *DB) readFreeValuesFromFile() error {
+	// Read the free values list from offset 32 in the values file
+	// Each entry is 8 bytes (int64 offset), we can store up to 508 entries
+	maxBytes := MaxFreeValueEntries * 8
+	buffer := make([]byte, maxBytes)
+
+	if _, err := db.valuesFile.ReadAt(buffer, FreeValuesListOffset); err != nil {
+		return fmt.Errorf("failed to read free values list: %w", err)
+	}
+
+	db.parseFreeValues(buffer)
+
+	debugPrint("Read %d free values from file\n", len(db.freeValues))
+	return nil
+}
+
+// readFreeValuesFromWAL reads the free values list from WAL/cache if available
+func (db *DB) readFreeValuesFromWAL() {
+	debugPrint("Reading free values list from WAL/cache\n")
+
+	// Try to read from WAL/cache (offset 32 is where free values are stored)
+	db.valueCacheMutex.RLock()
+	entry, exists := db.valueCache[FreeValuesListOffset]
+	if !exists || entry.value == nil {
+		db.valueCacheMutex.RUnlock()
+		// No WAL version available, keep current values
+		return
+	}
+
+	// Use the cached/WAL version
+	buffer := make([]byte, len(entry.value))
+	copy(buffer, entry.value)
+	db.valueCacheMutex.RUnlock()
+
+	db.parseFreeValues(buffer)
+
+	debugPrint("Read %d free values from WAL\n", len(db.freeValues))
+}
+
+// parseFreeValues parses a buffer containing free value offsets and populates the freeValues slice
+func (db *DB) parseFreeValues(buffer []byte) {
+	// Initialize the array
+	db.freeValues = make([]FreeValueEntry, 0, MaxFreeValueEntries)
+
+	// Parse each offset (8 bytes each) - don't stop on zeros
+	maxEntries := len(buffer) / 8
+	if maxEntries > MaxFreeValueEntries {
+		maxEntries = MaxFreeValueEntries
+	}
+
+	for i := 0; i < maxEntries; i++ {
+		offsetBytes := buffer[i*8 : (i+1)*8]
+		offset := int64(binary.LittleEndian.Uint64(offsetBytes))
+
+		if offset == 0 {
+			// Skip zero entries (deleted/empty slots)
+			continue
+		}
+
+		// Get the size of the value
+		size := db.getDeletedValueSize(offset)
+		if size > 0 {
+			db.freeValues = append(db.freeValues, FreeValueEntry{
+				Offset: offset,
+				Size:   size,
+			})
+		}
+	}
+}
+
+// restoreFreeValuesArray restores the free values list to the state before the current transaction
+func (db *DB) restoreFreeValuesArray() {
+	// Find the previous version of the free values list in the cache
+	db.valueCacheMutex.RLock()
+	entry, exists := db.valueCache[FreeValuesListOffset]
+
+	// Look for the version from before this transaction
+	for exists && entry != nil {
+		if entry.txnSequence < db.txnSequence {
+			// Found a version from before this transaction
+			break
+		}
+		entry = entry.next
+	}
+	db.valueCacheMutex.RUnlock()
+
+	if entry != nil && entry.value != nil {
+		// Use this previous version
+		debugPrint("Restoring free values list from transaction sequence %d\n", entry.txnSequence)
+		// Since discardNewerValues has already been called during rollback,
+		// the cache only contains values from before the current transaction
+		db.parseFreeValues(entry.value)
+		debugPrint("Restored array with %d free values\n", len(db.freeValues))
+	} else {
+		// No previous version found, read from file
+		debugPrint("Restoring free values list from file\n")
+		if err := db.readFreeValuesFromFile(); err != nil {
+			debugPrint("Failed to restore free values from file during rollback: %v\n", err)
+		}
+	}
+}
+
+// getDeletedValueSize reads the size of a deleted value at the given offset
+// Returns 0 if there's a newer version in cache (no longer free space)
+// Returns the size of the whole space (type + varint + value)
+func (db *DB) getDeletedValueSize(offset int64) uint32 {
+	// First check the value cache
+	db.valueCacheMutex.RLock()
+	entry := db.valueCache[offset]
+	db.valueCacheMutex.RUnlock()
+
+	/*
+	if entry != nil {
+		// If there's any entry in cache, it means this space is no longer free
+		if valueType == 'F' && entry.value != nil {
+			return 0
+		}
+		if valueType == 'V' && entry.value != nil {
+			return uint32(1 + varint.Size(uint64(len(entry.value))) + len(entry.value))
+		}
+	}
+	*/
+	// If there's any entry in cache, it means this space is no longer free
+	if entry != nil && entry.value != nil {
+		return 0
+	}
+
+	// No cache entry, read from file to get the deleted value size
+	if offset < PageSize || offset >= db.valuesFileSize {
+		return 0
+	}
+
+	// Read the type byte first
+	typeBuf := make([]byte, 1)
+	if _, err := db.valuesFile.ReadAt(typeBuf, offset); err != nil {
+		return 0
+	}
+
+	// Only process if it's a deleted value ('F')
+	if typeBuf[0] != 'F' {
+		return 0
+	}
+
+	// Read the value size varint
+	sizeBuf := make([]byte, 10) // Enough for varint
+	if _, err := db.valuesFile.ReadAt(sizeBuf, offset+1); err != nil {
+		return 0
+	}
+
+	if valueSize, bytesRead := varint.Read(sizeBuf); bytesRead > 0 {
+		// Return total size: type(1) + varint size + value size
+		return uint32(1 + bytesRead + int(valueSize))
+	}
+
+	return 0
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -2607,6 +2963,16 @@ func (db *DB) beginTransaction() {
 func (db *DB) commitTransaction() {
 	debugPrint("Committing transaction %d\n", db.txnSequence)
 
+	// Save the free values array if it was changed
+	if db.freeValuesChanged {
+		err := db.writeFreeValuesArray()
+		if err == nil {
+			db.freeValuesChanged = false
+		} else {
+			debugPrint("Failed to write free values array: %v\n", err)
+		}
+	}
+
 	// Release transaction lock if it was acquired for this transaction
 	if db.lockAcquiredForTransaction {
 		if err := db.releaseWriteLock(db.originalLockType); err != nil {
@@ -2650,6 +3016,9 @@ func (db *DB) rollbackTransaction() {
 
 	// Discard values from this transaction
 	db.discardNewerValues(db.txnSequence)
+
+	// Restore the free values list to the previous state
+	db.restoreFreeValuesArray()
 
 	// Release transaction lock if it was acquired for this transaction
 	if db.lockAcquiredForTransaction {
@@ -3781,8 +4150,8 @@ func (db *DB) allocateLeafPageWithSpace(spaceNeeded int) (*LeafSubPage, error) {
 		// Calculate the free space after adding the content
 		freeSpaceAfter := freeSpace - spaceNeeded
 
-		// if the free space is less than MIN_FREE_SPACE or there are no more available slots
-		if freeSpaceAfter < MIN_FREE_SPACE || usedSlots == 256 {
+		// if the free space is less than MIN_LEAF_FREE_SPACE or there are no more available slots
+		if freeSpaceAfter < MIN_LEAF_FREE_SPACE || usedSlots == 256 {
 			// Remove the page from the free list
 			db.removeFromFreeSpaceArray(position, leafPage.pageNumber)
 		} else {
@@ -4588,8 +4957,8 @@ func (db *DB) addToFreeSpaceArray(leafPage *LeafPage, freeSpace int) {
 		panic(fmt.Sprintf("Page %d has content size greater than page size: %d", leafPage.pageNumber, leafPage.ContentSize))
 	}
 
-	// Only add if the page has reasonable free space (at least MIN_FREE_SPACE bytes)
-	if freeSpace < MIN_FREE_SPACE {
+	// Only add if the page has reasonable free space (at least MIN_LEAF_FREE_SPACE bytes)
+	if freeSpace < MIN_LEAF_FREE_SPACE {
 		return
 	}
 
@@ -4696,7 +5065,7 @@ func (db *DB) updateFreeSpaceArray(position int, pageNumber uint32, newFreeSpace
 	debugPrint("Updating free space array for page %d to %d\n", pageNumber, newFreeSpace)
 
 	// If free space is too low, just remove the entry
-	if newFreeSpace < MIN_FREE_SPACE {
+	if newFreeSpace < MIN_LEAF_FREE_SPACE {
 		db.removeFromFreeSpaceArray(position, pageNumber)
 		return
 	}

@@ -236,7 +236,6 @@ func TestShortKeys(t *testing.T) {
 		t.Fatalf("Failed to open database: %v", err)
 	}
 	defer func() {
-		db.Close()
 		os.Remove(dbPath + "-keys")
 		os.Remove(dbPath + "-values")
 		os.Remove(dbPath + "-wal")
@@ -387,16 +386,34 @@ func TestShortKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to reopen database second time: %v", err)
 	}
-	defer func() {
-		reopenedDb2.Close()
-		os.Remove(dbPath + "-keys")
-		os.Remove(dbPath + "-values")
-		os.Remove(dbPath + "-wal")
-	}()
 
 	// Final verification of all keys
 	for key, expectedValue := range values {
 		result, err := reopenedDb2.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get '%s' after second reopen: %v", key, err)
+		}
+		if !bytes.Equal(result, []byte(expectedValue)) {
+			t.Fatalf("Value mismatch for '%s' after second reopen: got %s, want %s",
+				key, string(result), expectedValue)
+		}
+	}
+
+	// Close the database again
+	if err := reopenedDb2.Close(); err != nil {
+		t.Fatalf("Failed to close reopened database: %v", err)
+	}
+
+	// Reopen the database again
+	reopenedDb3, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database second time: %v", err)
+	}
+	defer reopenedDb3.Close()
+
+	// Final verification of all keys
+	for key, expectedValue := range values {
+		result, err := reopenedDb3.Get([]byte(key))
 		if err != nil {
 			t.Fatalf("Failed to get '%s' after second reopen: %v", key, err)
 		}
