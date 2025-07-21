@@ -788,13 +788,9 @@ func (db *DB) shouldCheckpoint(isCallerThread bool) bool {
 		return false
 	}
 
-	// Check WAL file size
-	walFileInfo, err := db.walInfo.file.Stat()
-	if err == nil {
-		// Checkpoint if WAL file exceeds size threshold
-		if walFileInfo.Size() > db.checkpointThreshold {
-			return true
-		}
+	// Checkpoint if WAL file exceeds size threshold
+	if db.walInfo.nextWritePosition > db.checkpointThreshold {
+		return true
 	}
 	return false
 }
