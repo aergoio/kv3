@@ -288,14 +288,14 @@ func (db *DB) writePageFrame(pageNumber uint32, pageData []byte) error {
 }
 
 // writeValueFrame writes a value frame to the WAL file
-func (db *DB) writeValueFrame(offset int64, value []byte) error {
+func (db *DB) writeValueFrame(offset int64, value []byte, valueSize uint32) error {
 	var valueData []byte
 	if offset == FreeValuesListOffset {
 		// use the raw value data
 		valueData = value
 	} else {
 		// Prepare the value data with type, size, and value
-		valueData = prepareValueData(value)
+		valueData = prepareValueData(value, valueSize)
 	}
 
 	// Write the frame header with the total segment size in the identifier field
@@ -316,7 +316,7 @@ func (db *DB) writeValueFrame(offset int64, value []byte) error {
 }
 
 // writeValueToWAL writes a value to the WAL file
-func (db *DB) writeValueToWAL(offset int64, value []byte) error {
+func (db *DB) writeValueToWAL(offset int64, value []byte, valueSize uint32) error {
 	// Check if we're in WAL mode
 	if !db.useWAL {
 		return nil
@@ -330,7 +330,7 @@ func (db *DB) writeValueToWAL(offset int64, value []byte) error {
 	}
 
 	// Write the value frame to the WAL file
-	err := db.writeValueFrame(offset, value)
+	err := db.writeValueFrame(offset, value, valueSize)
 	if err != nil {
 		return err
 	}
@@ -339,10 +339,19 @@ func (db *DB) writeValueToWAL(offset int64, value []byte) error {
 }
 
 // prepareValueData creates a properly formatted value data buffer with type, size, and value
-func prepareValueData(value []byte) []byte {
-	// If the value is nil, mark it as deleted
+func prepareValueData(value []byte, valueSize uint32) []byte {
+
+	// If the value is nil, mark it as deleted with original size
 	if value == nil {
-		return []byte{'F'}
+		// Create the deleted value data: type + size varint (no actual value data)
+		varintSize := varint.Size(uint64(valueSize))
+		totalSize := 1 + varintSize
+		valueData := make([]byte, totalSize)
+		// Write the type byte
+		valueData[0] = 'F'
+		// Write original value size as varint
+		varint.Write(valueData[1:], uint64(valueSize))
+		return valueData
 	}
 
 	// Calculate the exact size needed for the value data
@@ -596,11 +605,28 @@ func (db *DB) scanWAL() error {
 
 			debugPrint("Loading value (offset: %d) from WAL to cache\n", valueOffset)
 
+			// Calculate the value size for the cache entry
+			var entryValueSize uint32
+			if valueOffset == FreeValuesListOffset {
+				// For free-list data, the size is just the raw segment size
+				entryValueSize = uint32(segmentSize)
+			} else if valueType == 'V' && actualValue != nil {
+				// For regular values, store just the value size (not including type + varint)
+				entryValueSize = uint32(len(actualValue))
+			} else if valueType == 'F' && segmentSize > 1 {
+				// For deleted values, extract the original value size from the varint
+				originalSize, bytesRead := varint.Read(segment[1:])
+				if bytesRead > 0 {
+					entryValueSize = uint32(originalSize)
+				}
+			}
+
 			// Add the value to the value cache with versioning
 			db.valueCacheMutex.Lock()
 			existingEntry := db.valueCache[valueOffset]
 			newEntry := &ValueEntry{
 				value:       actualValue,
+				valueSize:   entryValueSize,
 				txnSequence: commitSequence,
 				isWAL:       true,
 				next:        existingEntry, // Link to previous version
@@ -910,7 +936,7 @@ func (db *DB) copyValuesToValuesFile(commitSequence int64) error {
 			valueData = entry.value
 		} else {
 			// Prepare the value data with type, size, and value
-			valueData = prepareValueData(entry.value)
+			valueData = prepareValueData(entry.value, entry.valueSize)
 		}
 
 		// Write the value data to the values file
@@ -1052,7 +1078,7 @@ func (db *DB) copyWALValuesToValuesFile() error {
 			valueData = entry.value
 		} else {
 			// Prepare the value data with type, size, and value
-			valueData = prepareValueData(entry.value)
+			valueData = prepareValueData(entry.value, entry.valueSize)
 		}
 
 		// Write the value data to the values file

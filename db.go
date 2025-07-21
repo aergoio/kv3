@@ -111,7 +111,8 @@ type FreeValueEntry struct {
 
 // ValueEntry represents a value entry in the value cache
 type ValueEntry struct {
-	value       []byte      // The value data
+	value       []byte      // The value data (nil for deleted values)
+	valueSize   uint32      // Size of the value data only (without type + varint), stored even when value is nil
 	txnSequence int64       // Transaction sequence number when this value was written
 	isWAL       bool        // Whether this value is part of the WAL
 	next        *ValueEntry // Pointer to the next entry with the same offset (for versioning)
@@ -1840,6 +1841,7 @@ func (db *DB) storeValue(value []byte, existingOffset ...int64) (int64, error) {
 				db.valueCacheMutex.Lock()
 				newEntry := &ValueEntry{
 					value:       value,
+					valueSize:   uint32(len(value)),
 					txnSequence: db.txnSequence,
 					isWAL:       false,
 					next:        existingEntry, // Link to previous version
@@ -1860,6 +1862,7 @@ func (db *DB) storeValue(value []byte, existingOffset ...int64) (int64, error) {
 		existingEntry := db.valueCache[freeOffset]
 		newEntry := &ValueEntry{
 			value:       value,
+			valueSize:   uint32(len(value)),
 			txnSequence: db.txnSequence,
 			isWAL:       false,
 			next:        existingEntry, // Link to previous version if it exists
@@ -1886,6 +1889,7 @@ func (db *DB) storeValue(value []byte, existingOffset ...int64) (int64, error) {
 	existingEntry := db.valueCache[offset]
 	newEntry := &ValueEntry{
 		value:       value,
+		valueSize:   uint32(len(value)),
 		txnSequence: db.txnSequence,
 		isWAL:       false,
 		next:        existingEntry, // Link to previous version if it exists
@@ -1901,12 +1905,20 @@ func (db *DB) storeValue(value []byte, existingOffset ...int64) (int64, error) {
 func (db *DB) deleteValue(offset int64) error {
 	// First, get the size of the value being deleted
 	var valueSize uint32
+	var segmentSize uint32
 
 	// Try to get size from cache first
 	db.valueCacheMutex.RLock()
-	if entry, exists := db.valueCache[offset]; exists && entry.value != nil {
-		// Calculate total size: type(1) + varint size + value size
-		valueSize = uint32(1 + varint.Size(uint64(len(entry.value))) + len(entry.value))
+	if entry, exists := db.valueCache[offset]; exists {
+		if entry.valueSize > 0 {
+			// Use the stored value size from the cache entry
+			valueSize = entry.valueSize
+		} else if entry.value != nil {
+			// Get value size from actual value
+			valueSize = uint32(len(entry.value))
+		}
+		// Calculate total segment size
+		segmentSize = uint32(1 + varint.Size(uint64(valueSize)) + int(valueSize))
 	}
 	db.valueCacheMutex.RUnlock()
 
@@ -1920,7 +1932,8 @@ func (db *DB) deleteValue(offset int64) error {
 				sizeBuf := make([]byte, 10) // Enough for varint
 				if _, err := db.valuesFile.ReadAt(sizeBuf, offset+1); err == nil {
 					if storedSize, bytesRead := varint.Read(sizeBuf); bytesRead > 0 {
-						valueSize = uint32(1 + bytesRead + int(storedSize))
+						valueSize = uint32(storedSize)
+						segmentSize = uint32(1 + bytesRead + int(storedSize))
 					}
 				}
 			}
@@ -1939,12 +1952,12 @@ func (db *DB) deleteValue(offset int64) error {
 	db.valueCache[offset] = newEntry
 	db.valueCacheMutex.Unlock()
 
-	// Add to free values list if we got a valid size
-	if valueSize > 0 {
-		db.addToFreeValuesList(offset, valueSize)
+	// Add to free values list if we got a valid size (use total segment size)
+	if segmentSize > 0 {
+		db.addToFreeValuesList(offset, segmentSize)
 	}
 
-	debugPrint("Marked value at offset %d as deleted (size: %d)\n", offset, valueSize)
+	debugPrint("Marked value at offset %d as deleted (value size: %d, total size: %d)\n", offset, valueSize, segmentSize)
 	return nil
 }
 
@@ -2137,6 +2150,7 @@ func (db *DB) writeFreeValuesArray() error {
 	existingEntry := db.valueCache[FreeValuesListOffset]
 	freeValuesEntry := &ValueEntry{
 		value:       buffer,
+		valueSize:   uint32(len(buffer)), // For free-list, this is the raw buffer size
 		txnSequence: db.txnSequence,
 		isWAL:       false,
 		next:        existingEntry,
@@ -2270,20 +2284,26 @@ func (db *DB) getDeletedValueSize(offset int64) uint32 {
 	entry := db.valueCache[offset]
 	db.valueCacheMutex.RUnlock()
 
-	/*
 	if entry != nil {
-		// If there's any entry in cache, it means this space is no longer free
-		if valueType == 'F' && entry.value != nil {
+		// If the cached entry has a non-nil value, this space is not free
+		if entry.value != nil {
 			return 0
 		}
-		if valueType == 'V' && entry.value != nil {
-			return uint32(1 + varint.Size(uint64(len(entry.value))) + len(entry.value))
+		// If the cached entry has nil value (deleted), calculate total segment size from value size
+		if entry.valueSize > 0 {
+			return uint32(1 + varint.Size(uint64(entry.valueSize)) + int(entry.valueSize))
 		}
-	}
-	*/
-	// If there's any entry in cache, it means this space is no longer free
-	if entry != nil && entry.value != nil {
-		return 0
+		// If no size stored, try to find the original size from version chain
+		for prev := entry.next; prev != nil; prev = prev.next {
+			if prev.valueSize > 0 {
+				return uint32(1 + varint.Size(uint64(prev.valueSize)) + int(prev.valueSize))
+			}
+			if prev.value != nil {
+				// Found the original value, calculate its size
+				return uint32(1 + varint.Size(uint64(len(prev.value))) + len(prev.value))
+			}
+		}
+		// If we can't find the original size from cache, fall through to file reading
 	}
 
 	// No cache entry, read from file to get the deleted value size
@@ -3835,7 +3855,7 @@ func (db *DB) flushValuesToWAL() error {
 		value := entry.value
 
 		// Write to WAL
-		if err := db.writeValueToWAL(offset, value); err != nil {
+		if err := db.writeValueToWAL(offset, value, entry.valueSize); err != nil {
 			return fmt.Errorf("failed to write value at offset %d to WAL: %w", offset, err)
 		}
 
