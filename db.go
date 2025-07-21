@@ -174,6 +174,9 @@ type DB struct {
 	// Free values list management
 	freeValues []FreeValueEntry // In-memory array of free value entries with size info
 	freeValuesChanged bool // Whether the free values list has been modified
+
+	// Timer-based flush management
+	lastFlushTime time.Time // Time of the last flush operation
 }
 
 // Transaction represents a database transaction
@@ -407,6 +410,7 @@ func Open(path string, options ...Options) (*DB, error) {
 		pendingCommands:    make(map[string]bool), // Initialize the pending commands map
 		valueCache:         make(map[int64]*ValueEntry), // Initialize the value cache
 		freeValues:         make([]FreeValueEntry, 0, MaxFreeValueEntries), // Initialize free values list
+		lastFlushTime:      time.Now(), // Initialize to current time
 	}
 
 	// Initialize each bucket's map
@@ -3837,6 +3841,9 @@ func (db *DB) flushIndexToDisk(isCallerThread bool) error {
 		}
 	}
 
+	// Update last flush time on successful flush
+	db.lastFlushTime = time.Now()
+
 	return nil
 }
 
@@ -5418,43 +5425,74 @@ func (db *DB) startBackgroundWorker() {
 		// Ensure the wait group is decremented when the goroutine exits
 		defer db.workerWaitGroup.Done()
 
-		for cmd := range db.workerChannel {
-			switch cmd {
+		// Timer for periodic flush (15 seconds)
+		flushInterval := 15 * time.Second
+		timer := time.NewTimer(flushInterval)
+		defer timer.Stop()
 
-			case "flush":
-				db.flushIndexToDisk(false)
-				// Clear the pending command flag
-				db.seqMutex.Lock()
-				delete(db.pendingCommands, "flush")
-				db.seqMutex.Unlock()
-
-			case "clean":
-				// Discard previous versions of values
-				db.discardOldValueVersions(true)
-				// Discard previous versions of pages
-				numPages := db.discardOldPageVersions(true)
-				// If the number of pages is still greater than the cache size threshold
-				if numPages > db.cacheSizeThreshold {
-					// Remove old pages from cache
-					db.removeOldPagesFromCache()
+		for {
+			select {
+			case cmd, ok := <-db.workerChannel:
+				if !ok {
+					// Channel closed, exit
+					return
 				}
-				// Clear the pending command flag
-				db.seqMutex.Lock()
-				delete(db.pendingCommands, "clean")
-				db.seqMutex.Unlock()
 
-			case "checkpoint":
-				db.checkpointWAL()
-				// Clear the pending command flag
-				db.seqMutex.Lock()
-				delete(db.pendingCommands, "checkpoint")
-				db.seqMutex.Unlock()
+				switch cmd {
+				case "flush":
+					db.flushIndexToDisk(false)
+					// Clear the pending command flag
+					db.seqMutex.Lock()
+					delete(db.pendingCommands, "flush")
+					db.seqMutex.Unlock()
 
-			case "exit":
-				return
+					// Reset timer after manual flush
+					if !timer.Stop() {
+						<-timer.C
+					}
+					timer.Reset(flushInterval)
 
-			default:
-				debugPrint("Unknown worker command: %s\n", cmd)
+				case "clean":
+					// Discard previous versions of values
+					db.discardOldValueVersions(true)
+					// Discard previous versions of pages
+					numPages := db.discardOldPageVersions(true)
+					// If the number of pages is still greater than the cache size threshold
+					if numPages > db.cacheSizeThreshold {
+						// Remove old pages from cache
+						db.removeOldPagesFromCache()
+					}
+					// Clear the pending command flag
+					db.seqMutex.Lock()
+					delete(db.pendingCommands, "clean")
+					db.seqMutex.Unlock()
+
+				case "checkpoint":
+					db.checkpointWAL()
+					// Clear the pending command flag
+					db.seqMutex.Lock()
+					delete(db.pendingCommands, "checkpoint")
+					db.seqMutex.Unlock()
+
+				case "exit":
+					return
+
+				default:
+					debugPrint("Unknown worker command: %s\n", cmd)
+				}
+
+			case <-timer.C:
+				// Timer expired, check if we need to flush
+				timeSinceLastFlush := time.Since(db.lastFlushTime)
+				if timeSinceLastFlush >= flushInterval {
+					// Only flush if there are dirty pages or if it's been a while
+					if db.dirtyPageCount > 0 {
+						debugPrint("Timer-based flush triggered after %v\n", timeSinceLastFlush)
+						db.flushIndexToDisk(false)
+					}
+				}
+				// Reset timer for next interval
+				timer.Reset(flushInterval)
 			}
 		}
 	}()
