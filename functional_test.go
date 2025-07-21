@@ -4596,3 +4596,977 @@ func generateDeterministicBytes(seed int, size int) []byte {
 
 	return bytes
 }
+
+// TestFreeSpaceReutilization tests various scenarios of free space reuse
+func TestFreeSpaceReutilization(t *testing.T) {
+	testCases := []struct {
+		name string
+		test func(t *testing.T)
+	}{
+		{"SameTransaction_SameSize", testFreeSpaceReutilizationSameTransactionSameSize},
+		{"SameTransaction_SmallerSize", testFreeSpaceReutilizationSameTransactionSmallerSize},
+		{"DifferentTransactions_SameConnection", testFreeSpaceReutilizationDifferentTransactionsSameConnection},
+		{"ReopenDB_ReadFromWAL", testFreeSpaceReutilizationReopenDBReadFromWAL},
+		{"ReopenTwice_ReadFromFile", testFreeSpaceReutilizationReopenTwiceReadFromFile},
+		{"NewKeyReuseSpace", testFreeSpaceReutilizationNewKeyReuseSpace},
+		{"ExistingKeyBiggerValue", testFreeSpaceReutilizationExistingKeyBiggerValue},
+		{"DeleteAndInsertCycle", testFreeSpaceReutilizationDeleteAndInsertCycle},
+		{"DeleteFirstOfTwoValues", testFreeSpaceReutilizationDeleteFirstOfTwoValues},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, tc.test)
+	}
+}
+
+// Helper function to get file size
+func getFileSize(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
+
+// Helper function to count non-zero entries in free-list
+func getFreeListInfo(db *DB) (int, []int64) {
+	count := 0
+	var offsets []int64
+
+	for _, entry := range db.freeValues {
+		if entry.Offset != 0 {
+			count++
+			offsets = append(offsets, entry.Offset)
+		}
+	}
+
+	return count, offsets
+}
+
+// Test 1A: Same transaction, same size value update - verify no space growth
+func testFreeSpaceReutilizationSameTransactionSameSize(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := tempDir + "/test.db"
+
+	// Open database
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// Start transaction
+	txn, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Failed to begin transaction: %v", err)
+	}
+
+	// Insert initial value
+	key := "test-key"
+	value1 := "value-1234567890" // 17 bytes
+	err = txn.Set([]byte(key), []byte(value1))
+	if err != nil {
+		t.Fatalf("Failed to set initial value: %v", err)
+	}
+
+	// Commit to establish baseline
+	err = txn.Commit()
+	if err != nil {
+		t.Fatalf("Failed to commit initial transaction: %v", err)
+	}
+
+	// Get initial file size
+	initialSize := getFileSize(dbPath + "-values")
+
+	// Start new transaction and update with same size value
+	txn2, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Failed to begin second transaction: %v", err)
+	}
+
+	value2 := "new-value-abcdefg" // 17 bytes (same size)
+	err = txn2.Set([]byte(key), []byte(value2))
+	if err != nil {
+		t.Fatalf("Failed to update value: %v", err)
+	}
+
+	err = txn2.Commit()
+	if err != nil {
+		t.Fatalf("Failed to commit update transaction: %v", err)
+	}
+
+	// Get final file size - should not have grown at all for same-size updates
+	finalSize := getFileSize(dbPath + "-values")
+
+	// The file size should not grow for same-size updates
+	if finalSize != initialSize {
+		t.Fatalf("File size changed for same-size update: %d -> %d (should be identical)", initialSize, finalSize)
+	}
+
+	// Verify the updated value
+	result, err := db.Get([]byte(key))
+	if err != nil {
+		t.Fatalf("Failed to get updated value: %v", err)
+	}
+	if string(result) != value2 {
+		t.Fatalf("Updated value mismatch: expected %s, got %s", value2, string(result))
+	}
+}
+
+// Test 1B: Different transactions, smaller size value update - verify space is freed
+func testFreeSpaceReutilizationSameTransactionSmallerSize(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := tempDir + "/test.db"
+
+	// Open database
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// Start transaction
+	txn, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Failed to begin transaction: %v", err)
+	}
+
+	// Insert 3 values to ensure the middle one doesn't trigger file shrinking
+	key1 := "test-key-1"
+	key2 := "test-key-2"
+	key3 := "test-key-3"
+	value1 := "value-1-content" // 15 bytes
+	value2large := "large-value-1234567890abcdef" // 29 bytes
+	value3 := "value-3-content" // 15 bytes
+
+	err = txn.Set([]byte(key1), []byte(value1))
+	if err != nil {
+		t.Fatalf("Failed to set first value: %v", err)
+	}
+
+	err = txn.Set([]byte(key2), []byte(value2large))
+	if err != nil {
+		t.Fatalf("Failed to set second value: %v", err)
+	}
+
+	err = txn.Set([]byte(key3), []byte(value3))
+	if err != nil {
+		t.Fatalf("Failed to set third value: %v", err)
+	}
+
+	err = txn.Commit()
+	if err != nil {
+		t.Fatalf("Failed to commit first transaction: %v", err)
+	}
+
+	// Get free-list count before update
+	freeCountBefore, _ := getFreeListInfo(db)
+
+	// Start second transaction to update the middle value with smaller size
+	txn2, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Failed to begin second transaction: %v", err)
+	}
+
+	value2small := "small-val" // 9 bytes (smaller)
+	err = txn2.Set([]byte(key2), []byte(value2small))
+	if err != nil {
+		t.Fatalf("Failed to update middle value: %v", err)
+	}
+
+	err = txn2.Commit()
+	if err != nil {
+		t.Fatalf("Failed to commit second transaction: %v", err)
+	}
+
+	// Get free-list count after commit - should have freed space
+	freeCountAfter, _ := getFreeListInfo(db)
+
+	// Verify that space was added to free-list when value was shrunk
+	if freeCountAfter <= freeCountBefore {
+		t.Fatalf("Free-list did not grow after shrinking value: before=%d, after=%d", freeCountBefore, freeCountAfter)
+	}
+
+	// Verify the updated middle value
+	result, err := db.Get([]byte(key2))
+	if err != nil {
+		t.Fatalf("Failed to get updated value: %v", err)
+	}
+	if string(result) != value2small {
+		t.Fatalf("Updated value mismatch: expected %s, got %s", value2small, string(result))
+	}
+}
+
+// Test 2A: Different transactions, same connection - verify space reuse with file size monitoring
+func testFreeSpaceReutilizationDifferentTransactionsSameConnection(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := tempDir + "/test.db"
+
+	// Open database
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// First transaction: insert 3 values and delete the middle one
+	txn1, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Failed to begin first transaction: %v", err)
+	}
+
+	key1 := "keep-me-1"
+	key2 := "delete-me"
+	key3 := "keep-me-3"
+	value1 := "value-1-content" // 15 bytes
+	value2 := "value-to-be-deleted-123456" // 26 bytes
+	value3 := "value-3-content" // 15 bytes
+
+	err = txn1.Set([]byte(key1), []byte(value1))
+	if err != nil {
+		t.Fatalf("Failed to set first value: %v", err)
+	}
+
+	err = txn1.Set([]byte(key2), []byte(value2))
+	if err != nil {
+		t.Fatalf("Failed to set second value: %v", err)
+	}
+
+	err = txn1.Set([]byte(key3), []byte(value3))
+	if err != nil {
+		t.Fatalf("Failed to set third value: %v", err)
+	}
+
+	err = txn1.Delete([]byte(key2))
+	if err != nil {
+		t.Fatalf("Failed to delete middle value: %v", err)
+	}
+
+	err = txn1.Commit()
+	if err != nil {
+		t.Fatalf("Failed to commit first transaction: %v", err)
+	}
+
+	// Check free-list after deletion - must have entries
+	freeCountAfterDelete, _ := getFreeListInfo(db)
+	if freeCountAfterDelete == 0 {
+		t.Fatalf("Free-list is empty after deletion - space not tracked")
+	}
+
+	// Get file size after deletion
+	sizeAfterDelete := getLogicalFileSize(db)
+
+	// Second transaction: insert new value that should reuse space
+	txn2, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Failed to begin second transaction: %v", err)
+	}
+
+	newKey := "new-key"
+	newValue := "reused-space-value" // 18 bytes (smaller than deleted value)
+	err = txn2.Set([]byte(newKey), []byte(newValue))
+	if err != nil {
+		t.Fatalf("Failed to set value in second transaction: %v", err)
+	}
+
+	err = txn2.Commit()
+	if err != nil {
+		t.Fatalf("Failed to commit second transaction: %v", err)
+	}
+
+	// Check free-list after reuse - must have fewer entries
+	freeCountAfterReuse, _ := getFreeListInfo(db)
+	if freeCountAfterReuse >= freeCountAfterDelete {
+		t.Fatalf("Free-list did not decrease after reuse: before=%d, after=%d", freeCountAfterDelete, freeCountAfterReuse)
+	}
+
+	// Get final file size - should not have grown
+	finalSize := getLogicalFileSize(db)
+	if finalSize > sizeAfterDelete {
+		t.Fatalf("File size grew after space reuse: %d -> %d", sizeAfterDelete, finalSize)
+	}
+
+	// Verify the new value exists and deleted one doesn't
+	result, err := db.Get([]byte(newKey))
+	if err != nil {
+		t.Fatalf("Failed to get new value: %v", err)
+	}
+	if string(result) != newValue {
+		t.Fatalf("New value mismatch: expected %s, got %s", newValue, string(result))
+	}
+
+	// Verify deleted key doesn't exist
+	_, err = db.Get([]byte(key2))
+	if err == nil {
+		t.Fatalf("Deleted key still exists")
+	}
+}
+
+// Test 2B: Reopen DB (read from WAL) - verify free-list persistence
+func testFreeSpaceReutilizationReopenDBReadFromWAL(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := tempDir + "/test.db"
+
+	var sizeAfterDelete int64
+
+	// First session: create and delete (testing file shrinking optimization)
+	{
+		db, err := Open(dbPath)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+
+		txn, err := db.Begin()
+		if err != nil {
+			t.Fatalf("Failed to begin transaction: %v", err)
+		}
+
+		key := "temp-key"
+		value := "temporary-value-for-deletion" // 28 bytes
+		err = txn.Set([]byte(key), []byte(value))
+		if err != nil {
+			t.Fatalf("Failed to set temporary value: %v", err)
+		}
+
+		err = txn.Delete([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to delete temporary value: %v", err)
+		}
+
+		err = txn.Commit()
+		if err != nil {
+			t.Fatalf("Failed to commit transaction: %v", err)
+		}
+
+		// Record file size after deletion
+		// Since we deleted the last (and only) value, the file should have shrunk
+		// and there should be no free-list entries (file shrinking optimization)
+		freeCount, _ := getFreeListInfo(db)
+		if freeCount != 0 {
+			t.Errorf("Expected empty free-list after last value deletion (file shrinking), but got %d entries", freeCount)
+		}
+		sizeAfterDelete = getLogicalFileSize(db)
+
+		// The file should have shrunk back to just the header size (4096 bytes)
+		if sizeAfterDelete != 4096 {
+			t.Errorf("Expected file to shrink to 4096 bytes after last value deletion, but got %d bytes", sizeAfterDelete)
+		}
+
+		db.Close()
+	}
+
+	// Second session: reopen and insert (should work normally even with empty free-list)
+	{
+		db, err := Open(dbPath)
+		if err != nil {
+			t.Fatalf("Failed to reopen database: %v", err)
+		}
+		defer db.Close()
+
+		// Check that free-list is still empty (no entries to restore from WAL)
+		freeCount, _ := getFreeListInfo(db)
+		if freeCount != 0 {
+			t.Errorf("Expected empty free-list after reopen, but got %d entries", freeCount)
+		}
+
+		txn, err := db.Begin()
+		if err != nil {
+			t.Fatalf("Failed to begin transaction after reopen: %v", err)
+		}
+
+		newKey := "new-key"
+		newValue := "new-value-after-shrink" // 22 bytes
+		err = txn.Set([]byte(newKey), []byte(newValue))
+		if err != nil {
+			t.Fatalf("Failed to set new value after reopen: %v", err)
+		}
+
+		err = txn.Commit()
+		if err != nil {
+			t.Fatalf("Failed to commit transaction after reopen: %v", err)
+		}
+
+		// Verify file grew appropriately for the new value
+		finalSize := getLogicalFileSize(db)
+		expectedGrowth := 1 + 1 + 22 // 'V' + varint(22) + 22 bytes = 24 bytes
+		if finalSize != sizeAfterDelete+int64(expectedGrowth) {
+			t.Errorf("File size after new value: expected %d, got %d", sizeAfterDelete+int64(expectedGrowth), finalSize)
+		}
+
+		// Verify the new value
+		result, err := db.Get([]byte(newKey))
+		if err != nil {
+			t.Fatalf("Failed to get new value after reopen: %v", err)
+		}
+		if string(result) != newValue {
+			t.Fatalf("New value mismatch after reopen: expected %s, got %s", newValue, string(result))
+		}
+	}
+}
+
+// Test 2C: Reopen twice (read from file, no WAL) - verify free-list file persistence
+func testFreeSpaceReutilizationReopenTwiceReadFromFile(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := tempDir + "/test.db"
+
+	var sizeAfterCheckpoint int64
+
+	// First session: create and delete
+	{
+		db, err := Open(dbPath)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+
+		txn, err := db.Begin()
+		if err != nil {
+			t.Fatalf("Failed to begin transaction: %v", err)
+		}
+
+		key1 := "keep-key-1"
+		key2 := "temp-key"
+		key3 := "keep-key-3"
+		value1 := "keep-value-1" // 12 bytes
+		value2 := "temporary-value-for-deletion-long" // 33 bytes
+		value3 := "keep-value-3" // 12 bytes
+
+		err = txn.Set([]byte(key1), []byte(value1))
+		if err != nil {
+			t.Fatalf("Failed to set first value: %v", err)
+		}
+
+		err = txn.Set([]byte(key2), []byte(value2))
+		if err != nil {
+			t.Fatalf("Failed to set temporary value: %v", err)
+		}
+
+		err = txn.Set([]byte(key3), []byte(value3))
+		if err != nil {
+			t.Fatalf("Failed to set third value: %v", err)
+		}
+
+		err = txn.Delete([]byte(key2))
+		if err != nil {
+			t.Fatalf("Failed to delete middle value: %v", err)
+		}
+
+		err = txn.Commit()
+		if err != nil {
+			t.Fatalf("Failed to commit transaction: %v", err)
+		}
+
+		db.Close()
+	}
+
+	// Second session: reopen and close (automatic checkpoint will flush WAL to file)
+	{
+		db, err := Open(dbPath)
+		if err != nil {
+			t.Fatalf("Failed to reopen database first time: %v", err)
+		}
+
+		// Record state after automatic checkpoint
+		freeCount, _ := getFreeListInfo(db)
+		if freeCount == 0 {
+			t.Fatalf("Free-list is empty after checkpoint")
+		}
+		sizeAfterCheckpoint = getLogicalFileSize(db)
+
+		db.Close()
+	}
+
+	// Third session: reopen again (should read free-list from file)
+	{
+		db, err := Open(dbPath)
+		if err != nil {
+			t.Fatalf("Failed to reopen database second time: %v", err)
+		}
+		defer db.Close()
+
+		// Verify free-list was loaded from file
+		freeCount, _ := getFreeListInfo(db)
+		if freeCount == 0 {
+			t.Fatalf("Free-list not loaded from file after second reopen")
+		}
+
+		txn, err := db.Begin()
+		if err != nil {
+			t.Fatalf("Failed to begin transaction after second reopen: %v", err)
+		}
+
+		newKey := "file-reuse-key"
+		newValue := "reusing-from-file" // 17 bytes (smaller than deleted)
+		err = txn.Set([]byte(newKey), []byte(newValue))
+		if err != nil {
+			t.Fatalf("Failed to set new value after second reopen: %v", err)
+		}
+
+		err = txn.Commit()
+		if err != nil {
+			t.Fatalf("Failed to commit transaction after second reopen: %v", err)
+		}
+
+		// Verify file didn't grow
+		finalSize := getFileSize(dbPath + "-values")
+		if finalSize > sizeAfterCheckpoint {
+			t.Fatalf("File size grew after file-based space reuse: %d -> %d", sizeAfterCheckpoint, finalSize)
+		}
+
+		// Verify the new value
+		result, err := db.Get([]byte(newKey))
+		if err != nil {
+			t.Fatalf("Failed to get new value after second reopen: %v", err)
+		}
+		if string(result) != newValue {
+			t.Fatalf("New value mismatch after second reopen: expected %s, got %s", newValue, string(result))
+		}
+	}
+}
+
+// Test 3A: New key reusing space from deleted entry - verify multiple reuses
+func testFreeSpaceReutilizationNewKeyReuseSpace(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := tempDir + "/test.db"
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// Create and delete multiple entries to populate free-list
+	txn1, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Failed to begin transaction: %v", err)
+	}
+
+	// Create several entries of different sizes
+	entries := []struct {
+		key   string
+		value string
+	}{
+		{"key1", "value-size-20-bytes-x"}, // 20 bytes
+		{"key2", "value-size-15-bytx"},    // 15 bytes
+		{"key3", "value-size-25-bytes-abcde"}, // 25 bytes
+	}
+
+	for _, entry := range entries {
+		err = txn1.Set([]byte(entry.key), []byte(entry.value))
+		if err != nil {
+			t.Fatalf("Failed to set %s: %v", entry.key, err)
+		}
+	}
+
+	// Delete all entries
+	for _, entry := range entries {
+		err = txn1.Delete([]byte(entry.key))
+		if err != nil {
+			t.Fatalf("Failed to delete %s: %v", entry.key, err)
+		}
+	}
+
+	err = txn1.Commit()
+	if err != nil {
+		t.Fatalf("Failed to commit first transaction: %v", err)
+	}
+
+	// Check free-list after deletions - must have entries
+	freeCount, _ := getFreeListInfo(db)
+	if freeCount == 0 {
+		t.Fatalf("Free-list is empty after multiple deletions")
+	}
+
+	// Get file size after deletions
+	sizeAfterDeletions := getFileSize(dbPath + "-values")
+
+	// Insert new keys that should reuse the freed space
+	txn2, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Failed to begin second transaction: %v", err)
+	}
+
+	newEntries := []struct {
+		key   string
+		value string
+	}{
+		{"new-key-1", "reuse-18-bytes-xx"}, // 18 bytes (fits in 20-byte slot)
+		{"new-key-2", "reuse-12-bytes"},    // 14 bytes (fits in 15-byte slot)
+		{"new-key-3", "reuse-22-bytes-space-x"}, // 22 bytes (fits in 25-byte slot)
+	}
+
+	for _, entry := range newEntries {
+		err = txn2.Set([]byte(entry.key), []byte(entry.value))
+		if err != nil {
+			t.Fatalf("Failed to set new %s: %v", entry.key, err)
+		}
+	}
+
+	err = txn2.Commit()
+	if err != nil {
+		t.Fatalf("Failed to commit second transaction: %v", err)
+	}
+
+	// Check free-list after reuses - must be reduced
+	finalFreeCount, _ := getFreeListInfo(db)
+	if finalFreeCount >= freeCount {
+		t.Fatalf("Free-list did not decrease after reuses: %d -> %d", freeCount, finalFreeCount)
+	}
+
+	// Verify file size didn't grow
+	finalSize := getFileSize(dbPath + "-values")
+	if finalSize > sizeAfterDeletions {
+		t.Fatalf("File size grew after space reuse: %d -> %d", sizeAfterDeletions, finalSize)
+	}
+
+	// Verify all new entries exist
+	for _, entry := range newEntries {
+		result, err := db.Get([]byte(entry.key))
+		if err != nil {
+			t.Fatalf("Failed to get %s: %v", entry.key, err)
+		}
+		if string(result) != entry.value {
+			t.Fatalf("Value mismatch for %s: expected %s, got %s", entry.key, entry.value, string(result))
+		}
+	}
+
+	// Verify original entries are gone
+	for _, entry := range entries {
+		_, err := db.Get([]byte(entry.key))
+		if err == nil {
+			t.Fatalf("Deleted key %s still exists", entry.key)
+		}
+	}
+}
+
+// Test 3B: Existing key with bigger value that fits in free space
+func testFreeSpaceReutilizationExistingKeyBiggerValue(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := tempDir + "/test.db"
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	txn1, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Failed to begin transaction: %v", err)
+	}
+
+	// Create 3 keys, we'll delete the middle one to avoid file shrinking
+	key1 := "persistent-key-1"
+	key2 := "temp-key"
+	key3 := "persistent-key-3"
+	value1 := "small-val-1" // 11 bytes
+	value2 := "large-temporary-value-that-will-be-deleted" // 42 bytes
+	value3 := "small-val-3" // 11 bytes
+
+	err = txn1.Set([]byte(key1), []byte(value1))
+	if err != nil {
+		t.Fatalf("Failed to set first key: %v", err)
+	}
+
+	err = txn1.Set([]byte(key2), []byte(value2))
+	if err != nil {
+		t.Fatalf("Failed to set temporary key: %v", err)
+	}
+
+	err = txn1.Set([]byte(key3), []byte(value3))
+	if err != nil {
+		t.Fatalf("Failed to set third key: %v", err)
+	}
+
+	// Delete the middle value to create free space
+	err = txn1.Delete([]byte(key2))
+	if err != nil {
+		t.Fatalf("Failed to delete middle key: %v", err)
+	}
+
+	err = txn1.Commit()
+	if err != nil {
+		t.Fatalf("Failed to commit first transaction: %v", err)
+	}
+
+	// Record state after deletion
+	freeCount, _ := getFreeListInfo(db)
+	if freeCount == 0 {
+		t.Fatalf("Free-list is empty after deletion")
+	}
+	sizeAfterDelete := getLogicalFileSize(db)
+
+	// Update the first persistent key with a larger value that should fit in the freed space
+	txn2, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Failed to begin second transaction: %v", err)
+	}
+
+	newPersistentValue := "updated-larger-value-for-existing-key" // 35 bytes (larger than original 11, fits in freed 42)
+	err = txn2.Set([]byte(key1), []byte(newPersistentValue))
+	if err != nil {
+		t.Fatalf("Failed to update first persistent key: %v", err)
+	}
+
+	err = txn2.Commit()
+	if err != nil {
+		t.Fatalf("Failed to commit second transaction: %v", err)
+	}
+
+	// Verify space was reused
+	finalFreeCount, _ := getFreeListInfo(db)
+	if finalFreeCount >= freeCount {
+		t.Fatalf("Free-list did not decrease after reuse: %d -> %d", freeCount, finalFreeCount)
+	}
+
+	finalSize := getLogicalFileSize(db)
+	if finalSize > sizeAfterDelete {
+		t.Fatalf("File size grew after space reuse: %d -> %d", sizeAfterDelete, finalSize)
+	}
+
+	// Verify the updated value
+	result, err := db.Get([]byte(key1))
+	if err != nil {
+		t.Fatalf("Failed to get updated first persistent key: %v", err)
+	}
+	if string(result) != newPersistentValue {
+		t.Fatalf("Updated value mismatch: expected %s, got %s", newPersistentValue, string(result))
+	}
+
+	// Verify deleted key doesn't exist
+	_, err = db.Get([]byte(key2))
+	if err == nil {
+		t.Fatalf("Deleted key still exists")
+	}
+}
+
+// Test 4: Delete and insert cycle with exact and smaller sizes
+func testFreeSpaceReutilizationDeleteAndInsertCycle(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := tempDir + "/test.db"
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// Test exact size reuse
+	txn1, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Failed to begin transaction: %v", err)
+	}
+
+	key1 := "exact-size-key"
+	value1 := "exact-size-value-20b" // 20 bytes
+	err = txn1.Set([]byte(key1), []byte(value1))
+	if err != nil {
+		t.Fatalf("Failed to set exact size value: %v", err)
+	}
+
+	err = txn1.Delete([]byte(key1))
+	if err != nil {
+		t.Fatalf("Failed to delete exact size value: %v", err)
+	}
+
+	// Insert new value of exact same size
+	key2 := "new-exact-size-key"
+	value2 := "new-exact-value-20b" // 20 bytes (exact same size)
+	err = txn1.Set([]byte(key2), []byte(value2))
+	if err != nil {
+		t.Fatalf("Failed to set new exact size value: %v", err)
+	}
+
+	err = txn1.Commit()
+	if err != nil {
+		t.Fatalf("Failed to commit transaction: %v", err)
+	}
+
+	// Get file size after exact reuse
+	sizeAfterExactReuse := getFileSize(dbPath + "-values")
+
+	// Test smaller size reuse
+	txn2, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Failed to begin second transaction: %v", err)
+	}
+
+	key3 := "large-key"
+	value3 := "large-value-for-smaller-reuse-test" // 34 bytes
+	err = txn2.Set([]byte(key3), []byte(value3))
+	if err != nil {
+		t.Fatalf("Failed to set large value: %v", err)
+	}
+
+	err = txn2.Delete([]byte(key3))
+	if err != nil {
+		t.Fatalf("Failed to delete large value: %v", err)
+	}
+
+	// Insert new value of smaller size
+	key4 := "small-reuse-key"
+	value4 := "small-reuse-val" // 15 bytes (smaller than 34)
+	err = txn2.Set([]byte(key4), []byte(value4))
+	if err != nil {
+		t.Fatalf("Failed to set small reuse value: %v", err)
+	}
+
+	err = txn2.Commit()
+	if err != nil {
+		t.Fatalf("Failed to commit second transaction: %v", err)
+	}
+
+	// Final verification - file should not have grown beyond exact reuse
+	finalSize := getFileSize(dbPath + "-values")
+	if finalSize > sizeAfterExactReuse {
+		t.Fatalf("File size grew after second reuse: %d -> %d", sizeAfterExactReuse, finalSize)
+	}
+
+	// Verify values exist
+	result2, err := db.Get([]byte(key2))
+	if err != nil {
+		t.Fatalf("Failed to get exact size reuse value: %v", err)
+	}
+	if string(result2) != value2 {
+		t.Fatalf("Exact size reuse value mismatch: expected %s, got %s", value2, string(result2))
+	}
+
+	result4, err := db.Get([]byte(key4))
+	if err != nil {
+		t.Fatalf("Failed to get smaller reuse value: %v", err)
+	}
+	if string(result4) != value4 {
+		t.Fatalf("Smaller reuse value mismatch: expected %s, got %s", value4, string(result4))
+	}
+
+	// Verify all intermediate keys are gone
+	for _, key := range []string{key1, key3} {
+		_, err := db.Get([]byte(key))
+		if err == nil {
+			t.Fatalf("Deleted key %s still exists", key)
+		}
+	}
+}
+
+// Test: Delete first of two values - file should not grow when reusing space
+func testFreeSpaceReutilizationDeleteFirstOfTwoValues(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := tempDir + "/test.db"
+
+	var sizeAfterDelete int64
+
+	// First session: create two values and delete the first
+	{
+		db, err := Open(dbPath)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+
+		txn, err := db.Begin()
+		if err != nil {
+			t.Fatalf("Failed to begin transaction: %v", err)
+		}
+
+		// Create first value
+		key1 := "first-key"
+		value1 := "first-value-to-be-deleted-later" // 32 bytes
+		err = txn.Set([]byte(key1), []byte(value1))
+		if err != nil {
+			t.Fatalf("Failed to set first value: %v", err)
+		}
+
+		// Create second value
+		key2 := "second-key"
+		value2 := "second-value-stays-in-file" // 27 bytes
+		err = txn.Set([]byte(key2), []byte(value2))
+		if err != nil {
+			t.Fatalf("Failed to set second value: %v", err)
+		}
+
+		// Delete the first value (not the last one)
+		err = txn.Delete([]byte(key1))
+		if err != nil {
+			t.Fatalf("Failed to delete first value: %v", err)
+		}
+
+		err = txn.Commit()
+		if err != nil {
+			t.Fatalf("Failed to commit transaction: %v", err)
+		}
+
+		// Record free-list state and file size
+		freeCount, _ := getFreeListInfo(db)
+		if freeCount == 0 {
+			t.Fatalf("Free-list is empty after deletion of first value")
+		}
+		sizeAfterDelete = getLogicalFileSize(db)
+
+		db.Close()
+	}
+
+	// Second session: reopen and insert (should read free-list from WAL)
+	{
+		db, err := Open(dbPath)
+		if err != nil {
+			t.Fatalf("Failed to reopen database: %v", err)
+		}
+		defer db.Close()
+
+		// Check if free-list was restored from WAL
+		freeCount, _ := getFreeListInfo(db)
+		if freeCount == 0 {
+			t.Fatalf("Free-list not restored from WAL after reopen")
+		}
+
+		txn, err := db.Begin()
+		if err != nil {
+			t.Fatalf("Failed to begin transaction after reopen: %v", err)
+		}
+
+		newKey := "reuse-first-slot"
+		newValue := "reusing-first-space" // 19 bytes (smaller than deleted 32 bytes)
+		err = txn.Set([]byte(newKey), []byte(newValue))
+		if err != nil {
+			t.Fatalf("Failed to set new value after reopen: %v", err)
+		}
+
+		err = txn.Commit()
+		if err != nil {
+			t.Fatalf("Failed to commit transaction after reopen: %v", err)
+		}
+
+		// Verify file didn't grow (should be exactly the same since we're reusing middle space)
+		finalSize := getLogicalFileSize(db)
+		if finalSize != sizeAfterDelete {
+			t.Fatalf("File size changed after reusing middle space: %d -> %d", sizeAfterDelete, finalSize)
+		}
+
+		// Verify the new value exists
+		result, err := db.Get([]byte(newKey))
+		if err != nil {
+			t.Fatalf("Failed to get new value after reopen: %v", err)
+		}
+		if string(result) != newValue {
+			t.Fatalf("New value mismatch after reopen: expected %s, got %s", newValue, string(result))
+		}
+
+		// Verify the second value still exists
+		result2, err := db.Get([]byte("second-key"))
+		if err != nil {
+			t.Fatalf("Failed to get second value: %v", err)
+		}
+		if string(result2) != "second-value-stays-in-file" {
+			t.Fatalf("Second value was corrupted")
+		}
+
+		// Verify deleted key doesn't exist
+		_, err = db.Get([]byte("first-key"))
+		if err == nil {
+			t.Fatalf("Deleted key still exists")
+		}
+	}
+}
+
+// Helper function to get logical values file size from database
+func getLogicalFileSize(db *DB) int64 {
+	return db.valuesFileSize
+}
