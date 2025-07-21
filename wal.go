@@ -736,12 +736,6 @@ func (db *DB) walCommit(isCallerThread bool) error {
 			// Log error but don't fail the commit
 			debugPrint("Checkpoint failed: %v", err)
 		}
-	// If the commit is made by the main thread, clean up the cache
-	} else if db.commitMode == CallerThread {
-		// Clean up old page versions from cache
-		db.discardOldPageVersions(true)
-		// Discard previous versions of values
-		db.discardOldValueVersions(true)
 	}
 
 	return nil

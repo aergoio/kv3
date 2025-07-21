@@ -3249,25 +3249,22 @@ func (db *DB) checkPageCache(isWrite bool) {
 
 	// If the amount of dirty pages is above the threshold, flush them to disk
 	if isWrite && db.dirtyPageCount >= db.dirtyPageThreshold {
-		// If already flushed up to the current transaction, skip
+		// If already flushed up to the current transaction
 		if db.inTransaction && db.flushSequence == db.txnSequence - 1 {
-			return
-		}
-
-		// Check which thread should flush the pages
-		if db.commitMode == CallerThread {
-			// Write the pages to the WAL file
-			db.flushIndexToDisk(true)
+			// skip
 		} else {
-			// Signal the worker thread to flush the pages, if not already signaled
-			db.seqMutex.Lock()
-			if !db.pendingCommands["flush"] {
-				db.pendingCommands["flush"] = true
-				db.workerChannel <- "flush"
+			// Check which thread should flush the pages
+			if db.commitMode == WorkerThread {
+				// Signal the worker thread to flush the pages, if not already signaled
+				db.seqMutex.Lock()
+				if !db.pendingCommands["flush"] {
+					db.pendingCommands["flush"] = true
+					db.workerChannel <- "flush"
+				}
+				db.seqMutex.Unlock()
+				return
 			}
-			db.seqMutex.Unlock()
 		}
-		return
 	}
 
 	// If the size of the page cache is above the threshold, remove old pages
