@@ -1849,7 +1849,32 @@ func (db *DB) storeValue(value []byte, existingOffset ...int64) (int64, error) {
 				db.valueCache[existingOffset[0]] = newEntry
 				db.valueCacheMutex.Unlock()
 
-				debugPrint("Reused existing offset %d for value, size %d\n", existingOffset[0], newValueSize)
+				// If there's leftover space (at least 3 bytes), add it to the free list
+				leftoverSize := existingValueSize - newValueSize
+				if leftoverSize >= 3 {
+					leftoverOffset := existingOffset[0] + int64(newValueSize)
+
+					varintSize := uint32(varint.Size(uint64(leftoverSize - 2)))
+					leftoverValueSize := leftoverSize - 1 - varintSize
+
+					db.valueCacheMutex.Lock()
+					db.valueCache[leftoverOffset] = &ValueEntry{
+						value:       nil,
+						valueSize:   leftoverValueSize,
+						txnSequence: db.txnSequence,
+						isWAL:       false,
+					}
+					db.valueCacheMutex.Unlock()
+
+					// Add the leftover space to the free values list
+					db.addToFreeValuesList(leftoverOffset, leftoverSize)
+
+					debugPrint("Reused existing offset %d for value, size %d, added %d bytes of leftover space at offset %d to free list\n",
+						existingOffset[0], newValueSize, leftoverSize, leftoverOffset)
+				} else {
+					debugPrint("Reused existing offset %d for value, size %d\n", existingOffset[0], newValueSize)
+				}
+
 				return existingOffset[0], nil
 			}
 		}
