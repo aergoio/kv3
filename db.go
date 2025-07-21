@@ -1968,13 +1968,25 @@ func (db *DB) deleteValue(offset int64) error {
 	// Mark as deleted by storing an empty value with versioning
 	db.valueCacheMutex.Lock()
 	currentEntry := db.valueCache[offset]
-	newEntry := &ValueEntry{
-		value:       nil, // Mark as deleted with nil value
-		txnSequence: db.txnSequence,
-		isWAL:       false,
-		next:        currentEntry, // Link to previous version
+	// If this is the last value in the file, created on this transaction
+	if offset + int64(segmentSize) == db.valuesFileSize && currentEntry != nil && currentEntry.txnSequence == db.txnSequence {
+		debugPrint("Shrunk values file from %d to %d by removing last value\n", db.valuesFileSize, offset)
+		// Remove from cache
+		db.valueCache[offset] = nil
+		// Shrink the file size instead of marking as deleted
+		db.valuesFileSize = offset
+		// Do not add to free values list
+		segmentSize = 0
+	} else {
+		newEntry := &ValueEntry{
+			value:       nil, // Mark as deleted with nil value
+			valueSize:   valueSize, // Preserve the value size for free-list tracking
+			txnSequence: db.txnSequence,
+			isWAL:       false,
+			next:        currentEntry, // Link to previous version
+		}
+		db.valueCache[offset] = newEntry
 	}
-	db.valueCache[offset] = newEntry
 	db.valueCacheMutex.Unlock()
 
 	// Add to free values list if we got a valid size (use total segment size)
