@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 	"path/filepath"
+	//"github.com/aergoio/kv3/varint"
 )
 
 func TestDatabaseBasicOperations(t *testing.T) {
@@ -4874,10 +4875,12 @@ func testFreeSpaceReutilizationDifferentTransactionsSameConnection(t *testing.T)
 		t.Fatalf("Failed to commit second transaction: %v", err)
 	}
 
-	// Check free-list after reuse - must have fewer entries
+	// Check free-list after reuse - should still have 1 entry (leftover space)
+	// Deleted space: 28 bytes (1 + 1 + 26), New value needs: 20 bytes (1 + 1 + 18)
+	// Leftover: 28 - 20 = 8 bytes (≥ 3, so stays in free list)
 	freeCountAfterReuse, _ := getFreeListInfo(db)
-	if freeCountAfterReuse >= freeCountAfterDelete {
-		t.Fatalf("Free-list did not decrease after reuse: before=%d, after=%d", freeCountAfterDelete, freeCountAfterReuse)
+	if freeCountAfterReuse != 1 {
+		t.Fatalf("Expected free-list to have 1 entry (leftover space), got %d", freeCountAfterReuse)
 	}
 
 	// Get final file size - should not have grown
@@ -5254,12 +5257,12 @@ func testFreeSpaceReutilizationExistingKeyBiggerValue(t *testing.T) {
 		t.Fatalf("Failed to begin transaction: %v", err)
 	}
 
-	// Create 3 keys, we'll delete the middle one to avoid file shrinking
-	key1 := "persistent-key-1"
-	key2 := "temp-key"
+	// Create 3 keys, we'll put the big value on key1, then delete it, then update key3
+	key1 := "temp-key-1"
+	key2 := "persistent-key-2"
 	key3 := "persistent-key-3"
-	value1 := "small-val-1" // 11 bytes
-	value2 := "large-temporary-value-that-will-be-deleted" // 42 bytes
+	value1 := "large-temporary-value-that-will-be-deleted-later" // 48 bytes
+	value2 := "small-val-2" // 11 bytes
 	value3 := "small-val-3" // 11 bytes
 
 	err = txn1.Set([]byte(key1), []byte(value1))
@@ -5269,7 +5272,7 @@ func testFreeSpaceReutilizationExistingKeyBiggerValue(t *testing.T) {
 
 	err = txn1.Set([]byte(key2), []byte(value2))
 	if err != nil {
-		t.Fatalf("Failed to set temporary key: %v", err)
+		t.Fatalf("Failed to set second key: %v", err)
 	}
 
 	err = txn1.Set([]byte(key3), []byte(value3))
@@ -5277,10 +5280,10 @@ func testFreeSpaceReutilizationExistingKeyBiggerValue(t *testing.T) {
 		t.Fatalf("Failed to set third key: %v", err)
 	}
 
-	// Delete the middle value to create free space
-	err = txn1.Delete([]byte(key2))
+	// Delete key1 to create free space
+	err = txn1.Delete([]byte(key1))
 	if err != nil {
-		t.Fatalf("Failed to delete middle key: %v", err)
+		t.Fatalf("Failed to delete first key: %v", err)
 	}
 
 	err = txn1.Commit()
@@ -5290,21 +5293,21 @@ func testFreeSpaceReutilizationExistingKeyBiggerValue(t *testing.T) {
 
 	// Record state after deletion
 	freeCount, _ := getFreeListInfo(db)
-	if freeCount == 0 {
-		t.Fatalf("Free-list is empty after deletion")
+	if freeCount != 1 {
+		t.Fatalf("Free-list has unexpected size after deletion: %d", freeCount)
 	}
 	sizeAfterDelete := getLogicalFileSize(db)
 
-	// Update the first persistent key with a larger value that should fit in the freed space
+	// Update key3 with a larger value that should fit in the freed space
 	txn2, err := db.Begin()
 	if err != nil {
 		t.Fatalf("Failed to begin second transaction: %v", err)
 	}
 
-	newPersistentValue := "updated-larger-value-for-existing-key" // 35 bytes (larger than original 11, fits in freed 42)
-	err = txn2.Set([]byte(key1), []byte(newPersistentValue))
+	newPersistentValue := "larger-value-for-existing-key" // 29 bytes (larger than original 11, fits in freed 48)
+	err = txn2.Set([]byte(key3), []byte(newPersistentValue))
 	if err != nil {
-		t.Fatalf("Failed to update first persistent key: %v", err)
+		t.Fatalf("Failed to update third persistent key: %v", err)
 	}
 
 	err = txn2.Commit()
@@ -5312,10 +5315,48 @@ func testFreeSpaceReutilizationExistingKeyBiggerValue(t *testing.T) {
 		t.Fatalf("Failed to commit second transaction: %v", err)
 	}
 
-	// Verify space was reused
+	// Verify space was reused: the free list should now have 2 entries
+	// the old key3 entry and the leftover space entry
 	finalFreeCount, _ := getFreeListInfo(db)
-	if finalFreeCount >= freeCount {
-		t.Fatalf("Free-list did not decrease after reuse: %d -> %d", freeCount, finalFreeCount)
+	if finalFreeCount != 2 {
+		t.Fatalf("Expected free-list to have 2 entries (old key3 entry and leftover space), got %d", finalFreeCount)
+	}
+	// Calculate the expected offsets
+	// Value1 starts at 4096, size 48 bytes → total space 50 bytes (1 + 1 + 48)
+	// Value2 starts at 4096 + 50 = 4146, size 11 bytes → total space 13 bytes (1 + 1 + 11)
+	// Value3 starts at 4146 + 13 = 4159, size 11 bytes → total space 13 bytes (1 + 1 + 11)
+
+	value1Offset := int64(4096)
+	value2Offset := value1Offset + 50 // 4146
+	value3Offset := value2Offset + 13 // 4159
+
+	// When key1 is deleted, offset 4096 becomes free (50 bytes)
+	// When key3 is updated, it uses 31 bytes from offset 4096, leaving leftover at 4096 + 31 = 4127
+	expectedLeftoverOffset := value1Offset + 31 // 4127
+	expectedOldKey3Offset := value3Offset       // 4159
+
+	// Check that both expected offsets exist in the free list
+	leftoverIndex, _ := db.checkFreeValueAt(expectedLeftoverOffset)
+	if leftoverIndex < 0 {
+		t.Fatalf("Could not find expected leftover space at offset %d", expectedLeftoverOffset)
+	}
+	leftoverSize := db.freeValues[leftoverIndex].Size
+
+	oldKey3Index, _ := db.checkFreeValueAt(expectedOldKey3Offset)
+	if oldKey3Index < 0 {
+		t.Fatalf("Could not find expected old key3 space at offset %d", expectedOldKey3Offset)
+	}
+	oldKey3Size := db.freeValues[oldKey3Index].Size
+
+	// Verify the sizes
+	expectedLeftoverSize := uint32(50 - 31) // 19 bytes
+	expectedOldKey3Size := uint32(13)       // 13 bytes
+
+	if leftoverSize != expectedLeftoverSize {
+		t.Fatalf("Expected leftover size %d at offset %d, got %d", expectedLeftoverSize, expectedLeftoverOffset, leftoverSize)
+	}
+	if oldKey3Size != expectedOldKey3Size {
+		t.Fatalf("Expected old key3 size %d at offset %d, got %d", expectedOldKey3Size, expectedOldKey3Offset, oldKey3Size)
 	}
 
 	finalSize := getLogicalFileSize(db)
@@ -5323,17 +5364,44 @@ func testFreeSpaceReutilizationExistingKeyBiggerValue(t *testing.T) {
 		t.Fatalf("File size grew after space reuse: %d -> %d", sizeAfterDelete, finalSize)
 	}
 
-	// Verify the updated value
-	result, err := db.Get([]byte(key1))
+	// Now add a new entry with exactly the same size as the leftover free space
+	// This should consume the leftover space and make the free list empty
+	txn3, err := db.Begin()
 	if err != nil {
-		t.Fatalf("Failed to get updated first persistent key: %v", err)
+		t.Fatalf("Failed to begin third transaction: %v", err)
+	}
+
+	// Create a value that needs exactly the leftover space (19 bytes total)
+	// 19 bytes total = 1 byte type + 1 byte varint + 17 bytes data
+	exactFitValue := "exact-fit-entry17" // 17 bytes, needs 19 bytes total
+	exactFitKey := "exact-fit-key"
+	err = txn3.Set([]byte(exactFitKey), []byte(exactFitValue))
+	if err != nil {
+		t.Fatalf("Failed to set exact fit value: %v", err)
+	}
+
+	err = txn3.Commit()
+	if err != nil {
+		t.Fatalf("Failed to commit third transaction: %v", err)
+	}
+
+	// Verify the free list is now empty
+	emptyFreeCount, _ := getFreeListInfo(db)
+	if emptyFreeCount != 1 {
+		t.Fatalf("Expected free-list to have 1 entry after exact fit, got %d entries", emptyFreeCount)
+	}
+
+	// Verify the updated value
+	result, err := db.Get([]byte(key3))
+	if err != nil {
+		t.Fatalf("Failed to get updated third persistent key: %v", err)
 	}
 	if string(result) != newPersistentValue {
 		t.Fatalf("Updated value mismatch: expected %s, got %s", newPersistentValue, string(result))
 	}
 
 	// Verify deleted key doesn't exist
-	_, err = db.Get([]byte(key2))
+	_, err = db.Get([]byte(key1))
 	if err == nil {
 		t.Fatalf("Deleted key still exists")
 	}
@@ -5569,4 +5637,573 @@ func testFreeSpaceReutilizationDeleteFirstOfTwoValues(t *testing.T) {
 // Helper function to get logical values file size from database
 func getLogicalFileSize(db *DB) int64 {
 	return db.valuesFileSize
+}
+
+// TestMergedSpaceHandling tests the handling of merged space during value updates
+// and ensures proper cleanup of merged entries from the value cache
+func TestMergedSpaceHandling(t *testing.T) {
+	// Test all possible flush combinations (5 flush points = 32 combinations)
+	for flushMask := 0; flushMask < (1 << 5); flushMask++ {
+		t.Run(fmt.Sprintf("FlushMask_%05b", flushMask), func(t *testing.T) {
+			testMergedSpaceHandlingWithFlushes(t, flushMask)
+		})
+	}
+}
+
+/*
+// Helper function to print value cache debug info
+func printValueCacheDebug(t *testing.T, db *DB, step string) {
+	t.Logf("=== Value Cache Debug - %s ===", step)
+
+	// Access the value cache directly (this is for debugging only)
+	db.valueCacheMutex.RLock()
+	defer db.valueCacheMutex.RUnlock()
+
+	// Get all offsets and sort them
+	var offsets []int64
+	for offset := range db.valueCache {
+		offsets = append(offsets, offset)
+	}
+	sort.Slice(offsets, func(i, j int) bool {
+		return offsets[i] < offsets[j]
+	})
+
+	for _, offset := range offsets {
+		entry := db.valueCache[offset]
+		if entry != nil {
+			valueStr := "nil"
+			if entry.value != nil {
+				if len(entry.value) > 20 {
+					valueStr = fmt.Sprintf("%q...", string(entry.value[:20]))
+				} else {
+					valueStr = fmt.Sprintf("%q", string(entry.value))
+				}
+
+			}
+			t.Logf("  Offset %d: value=%s, valueSize=%d, txnSeq=%d, isWAL=%t, merged=%t",
+				offset, valueStr, entry.valueSize, entry.txnSequence, entry.isWAL, entry.merged)
+		}
+	}
+
+	// Also print free values list
+	t.Logf("=== Free Values List ===")
+	for i, freeVal := range db.freeValues {
+		if freeVal.Offset != 0 {
+			t.Logf("  [%d] Offset %d, Size %d", i, freeVal.Offset, freeVal.Size)
+		}
+	}
+	t.Logf("========================")
+}
+
+// Helper function to print key-value mappings with offsets
+func printKeyValueOffsets(t *testing.T, db *DB, keys []string, step string) {
+	t.Logf("=== Key-Value Mappings - %s ===", step)
+	for _, key := range keys {
+		value, err := db.Get([]byte(key))
+		if err != nil {
+			t.Logf("  %s: <NOT FOUND> (%v)", key, err)
+		} else {
+			t.Logf("  %s: %q", key, string(value))
+		}
+	}
+	t.Logf("==============================")
+}
+
+// Helper function to print leaf page contents
+func printLeafPageDebug(t *testing.T, db *DB, pageNumber uint32, step string) {
+	t.Logf("=== Leaf Page %d Debug - %s ===", pageNumber, step)
+
+	// Get the leaf page
+	page, err := db.getLeafPage(pageNumber)
+	if err != nil {
+		t.Logf("  Error getting leaf page: %v", err)
+		return
+	}
+
+	t.Logf("  Page %d: ContentSize=%d, SubPages total=%d", pageNumber, page.ContentSize, len(page.SubPages))
+
+	totalEntries := 0
+	activeSubPages := 0
+
+	// Iterate through each sub-page using range like the example
+	for subPageIdx, subPageInfo := range page.SubPages {
+		if subPageInfo.Offset != 0 {
+			activeSubPages++
+			t.Logf("    SubPage[%d]: Offset=%d, Size=%d", subPageIdx, subPageInfo.Offset, subPageInfo.Size)
+
+			entryCount := 0
+
+			// First pass - count entries
+			err := db.iterateLeafSubPageEntries(page, uint8(subPageIdx), func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, valueOffset int64) bool {
+				entryCount++
+				totalEntries++
+				return true
+			})
+
+			if err != nil {
+				t.Logf("    Error counting entries in sub-page %d: %v", subPageIdx, err)
+				continue
+			}
+
+			t.Logf("    SubPage[%d] has %d entries", subPageIdx, entryCount)
+
+			// Second pass - show entries
+			entryIdx := 0
+			db.iterateLeafSubPageEntries(page, uint8(subPageIdx), func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, valueOffset int64) bool {
+				if suffixLen > 0 && suffixOffset+suffixLen <= len(page.data) {
+					suffix := page.data[suffixOffset:suffixOffset+suffixLen]
+					t.Logf("      Entry[%d]: suffix=%q, valueOffset=%d, entrySize=%d", entryIdx, string(suffix), valueOffset, entrySize)
+				} else {
+					t.Logf("      Entry[%d]: <empty suffix>, valueOffset=%d, entrySize=%d", entryIdx, valueOffset, entrySize)
+				}
+				entryIdx++
+				return true
+			})
+		}
+	}
+
+	t.Logf("  Active SubPages: %d, Total entries: %d", activeSubPages, totalEntries)
+	t.Logf("================================")
+}
+
+// Helper function to print raw values file content
+func printValuesFileDebug(t *testing.T, db *DB) {
+	t.Logf("=== Values File Debug ===")
+
+	// Read raw file content from key offsets we're interested in
+	offsets := []int64{4096, 4111, 4125, 4131, 4139}
+
+	for _, offset := range offsets {
+		// Read the type byte first
+		typeBuf := make([]byte, 1)
+		if _, err := db.valuesFile.ReadAt(typeBuf, offset); err != nil {
+			t.Logf("  Offset %d: Error reading type: %v", offset, err)
+			continue
+		}
+
+		valueType := typeBuf[0]
+		currentOffset := offset + 1
+
+		t.Logf("  Offset %d: type='%c' (0x%02x)", offset, valueType, valueType)
+
+		if valueType == 'F' {
+			// For deleted values, read the original size
+			sizeBuf := make([]byte, 10) // Enough for varint
+			if _, err := db.valuesFile.ReadAt(sizeBuf, currentOffset); err != nil {
+				t.Logf("    Error reading deleted value size: %v", err)
+				continue
+			}
+
+			if valueSize64, bytesRead := varint.Read(sizeBuf); bytesRead > 0 {
+				t.Logf("    Deleted value, original size: %d", valueSize64)
+			} else {
+				t.Logf("    Deleted value, failed to parse size")
+			}
+		} else if valueType == 'V' {
+			// For regular values, read size and data
+			sizeBuf := make([]byte, 10) // Enough for varint
+			if _, err := db.valuesFile.ReadAt(sizeBuf, currentOffset); err != nil {
+				t.Logf("    Error reading value size: %v", err)
+				continue
+			}
+
+			valueSize64, bytesRead := varint.Read(sizeBuf)
+			if bytesRead == 0 {
+				t.Logf("    Failed to parse value size")
+				continue
+			}
+
+			valueSize := int(valueSize64)
+			currentOffset += int64(bytesRead)
+
+			// Read the value data
+			valueData := make([]byte, valueSize)
+			if _, err := db.valuesFile.ReadAt(valueData, currentOffset); err != nil {
+				t.Logf("    Error reading value data: %v", err)
+				continue
+			}
+
+			t.Logf("    Value size: %d, data: %q", valueSize, string(valueData))
+		} else {
+			t.Logf("    Unknown value type")
+		}
+	}
+
+	t.Logf("========================")
+}
+*/
+
+func testMergedSpaceHandlingWithFlushes(t *testing.T, flushMask int) {
+	// Clean up any existing test database
+	dbPath := "test_merged_space.db"
+	os.RemoveAll(dbPath + "-keys")
+	os.RemoveAll(dbPath + "-values")
+	os.RemoveAll(dbPath + "-wal")
+	defer func() {
+		os.RemoveAll(dbPath + "-keys")
+		os.RemoveAll(dbPath + "-values")
+		os.RemoveAll(dbPath + "-wal")
+	}()
+
+	// Open database with WAL enabled for more comprehensive testing
+	options := Options{
+		"useWAL":    true,
+		"writeMode": "CallerThread_WAL_Sync",
+	}
+	db, err := Open(dbPath, options)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+
+	// Helper function for conditional flushing
+	flushIfNeeded := func(flushPoint int) {
+		if (flushMask & (1 << flushPoint)) != 0 {
+			if err := db.Sync(); err != nil {
+				t.Fatalf("Failed to flush at point %d: %v", flushPoint, err)
+			}
+		}
+	}
+
+	// Step 1: Insert 3 pairs
+	initialData := map[string]string{
+		"key1": "small_value_1",      // 13 bytes
+		"key2": "medium_value_2_xyz", // 19 bytes
+		"key3": "tiny_3",             // 6 bytes
+	}
+
+	txn, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Failed to begin transaction: %v", err)
+	}
+
+	// Insert in deterministic order
+	orderedKeys := []string{"key1", "key2", "key3"}
+	for _, key := range orderedKeys {
+		value := initialData[key]
+		if err := txn.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set %s: %v", key, err)
+		}
+	}
+	err = txn.Commit()
+	if err != nil {
+		t.Fatalf("Failed to commit transaction: %v", err)
+	}
+
+	//printValueCacheDebug(t, db, "After Step 1 - Initial Insert")
+	//printKeyValueOffsets(t, db, []string{"key1", "key2", "key3"}, "After Step 1")
+	//printLeafPageDebug(t, db, 2, "After Step 1")
+
+	// Optional flush point 1
+	flushIfNeeded(0)
+
+	// Read and verify all values
+	for _, key := range orderedKeys {
+		expectedValue := initialData[key]
+		value, err := db.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get %s after initial insert: %v", key, err)
+		}
+		if string(value) != expectedValue {
+			t.Fatalf("Expected %s = %s, got %s", key, expectedValue, string(value))
+		}
+	}
+
+	// Step 2: Delete pair 2
+	if err := db.Delete([]byte("key2")); err != nil {
+		t.Fatalf("Failed to delete key2: %v", err)
+	}
+
+	//printValueCacheDebug(t, db, "After Step 2 - Delete key2")
+	//printKeyValueOffsets(t, db, []string{"key1", "key2", "key3"}, "After Step 2")
+	//printLeafPageDebug(t, db, 2, "After Step 2")
+
+	// Optional flush point 2
+	flushIfNeeded(1)
+
+	// Read and verify remaining values
+	for _, key := range orderedKeys {
+		expectedValue := initialData[key]
+		if key == "key2" {
+			// key2 should be deleted
+			_, err := db.Get([]byte(key))
+			if err == nil {
+				t.Fatalf("Expected key2 to be deleted, but it still exists")
+			}
+		} else {
+			value, err := db.Get([]byte(key))
+			if err != nil {
+				t.Fatalf("Failed to get %s after key2 deletion: %v", key, err)
+			}
+			if string(value) != expectedValue {
+				t.Fatalf("Expected %s = %s, got %s after key2 deletion", key, expectedValue, string(value))
+			}
+		}
+	}
+
+	// Step 3: Re-set pair 1 using a value bigger than before (to merge space from value 2)
+	biggerValue1 := "larger_value_to_merge_space"
+	if err := db.Set([]byte("key1"), []byte(biggerValue1)); err != nil {
+		t.Fatalf("Failed to set key1 with bigger value: %v", err)
+	}
+
+	//printValueCacheDebug(t, db, "After Step 3 - Set key1 bigger")
+	//printKeyValueOffsets(t, db, []string{"key1", "key2", "key3"}, "After Step 3")
+	//printLeafPageDebug(t, db, 2, "After Step 3")
+
+	// Optional flush point 3
+	flushIfNeeded(2)
+
+	// Read and verify all values
+	value1, err := db.Get([]byte("key1"))
+	if err != nil {
+		t.Fatalf("Failed to get key1 after bigger value set: %v", err)
+	}
+	if string(value1) != biggerValue1 {
+		t.Fatalf("Expected key1 = %s, got %s", biggerValue1, string(value1))
+	}
+
+	// key2 should still be deleted
+	_, err = db.Get([]byte("key2"))
+	if err == nil {
+		t.Fatalf("Expected key2 to still be deleted")
+	}
+
+	// key3 should be unchanged
+	value3, err := db.Get([]byte("key3"))
+	if err != nil {
+		t.Fatalf("Failed to get key3 after key1 bigger value: %v", err)
+	}
+	if string(value3) != initialData["key3"] {
+		t.Fatalf("Expected key3 = %s, got %s", initialData["key3"], string(value3))
+	}
+
+	// Step 4: Re-set pair 1 to use the same first value (space from value 2 will now be marked as free)
+	if err := db.Set([]byte("key1"), []byte(initialData["key1"])); err != nil {
+		t.Fatalf("Failed to reset key1 to original value: %v", err)
+	}
+
+	//printValueCacheDebug(t, db, "After Step 4 - Reset key1 to original")
+	//printKeyValueOffsets(t, db, []string{"key1", "key2", "key3"}, "After Step 4")
+	//printLeafPageDebug(t, db, 2, "After Step 4")
+
+	// Optional flush point 4
+	flushIfNeeded(3)
+
+	// Read and verify all values
+	value1, err = db.Get([]byte("key1"))
+	if err != nil {
+		t.Fatalf("Failed to get key1 after reset: %v", err)
+	}
+	if string(value1) != initialData["key1"] {
+		t.Fatalf("Expected key1 = %s, got %s after reset", initialData["key1"], string(value1))
+	}
+
+	// key2 should still be deleted
+	_, err = db.Get([]byte("key2"))
+	if err == nil {
+		t.Fatalf("Expected key2 to still be deleted after key1 reset")
+	}
+
+	// key3 should be unchanged
+	value3, err = db.Get([]byte("key3"))
+	if err != nil {
+		t.Fatalf("Failed to get key3 after key1 reset: %v", err)
+	}
+	if string(value3) != initialData["key3"] {
+		t.Fatalf("Expected key3 = %s, got %s after key1 reset", initialData["key3"], string(value3))
+	}
+
+	// Step 5: Re-set pair 2 with same value as before
+	if err := db.Set([]byte("key2"), []byte(initialData["key2"])); err != nil {
+		t.Fatalf("Failed to reset key2: %v", err)
+	}
+
+	//printValueCacheDebug(t, db, "After Step 5 - Reset key2 to original")
+	//printKeyValueOffsets(t, db, []string{"key1", "key2", "key3"}, "After Step 5")
+	//printLeafPageDebug(t, db, 2, "After Step 5")
+
+	// Optional flush point 5
+	flushIfNeeded(4)
+
+	// Read and verify all values
+	for _, key := range orderedKeys {
+		expectedValue := initialData[key]
+		value, err := db.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get %s after key2 reset: %v", key, err)
+		}
+		if string(value) != expectedValue {
+			t.Fatalf("Expected %s = %s, got %s after key2 reset", key, expectedValue, string(value))
+		}
+	}
+
+	// Step 6: Add another pair
+	newKey := "key4"
+	newValue := "new_value_4"
+	if err := db.Set([]byte(newKey), []byte(newValue)); err != nil {
+		t.Fatalf("Failed to set %s: %v", newKey, err)
+	}
+
+	//printValueCacheDebug(t, db, "After Step 6 - Add key4")
+	//printKeyValueOffsets(t, db, []string{"key1", "key2", "key3", "key4"}, "After Step 6")
+	//printLeafPageDebug(t, db, 2, "After Step 6")
+
+	// Read and verify all values (including the new one)
+	allExpectedData := make(map[string]string)
+	for k, v := range initialData {
+		allExpectedData[k] = v
+	}
+	allExpectedData[newKey] = newValue
+
+	allOrderedKeys := []string{"key1", "key2", "key3", "key4"}
+	for _, key := range allOrderedKeys {
+		expectedValue := allExpectedData[key]
+		value, err := db.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get %s after adding key4: %v", key, err)
+		}
+		if string(value) != expectedValue {
+			t.Fatalf("Expected %s = %s, got %s after adding key4", key, expectedValue, string(value))
+		}
+	}
+
+	// Verify the value cache contains expected values at expected offsets
+	verifyValueCacheContents(t, db, map[int64]string{
+		4096: "small_value_1",
+		4111: "new_value_4",
+		4125: "", // deleted value (key2)
+		4131: "tiny_3",
+		4139: "medium_value_2_xyz",
+	})
+
+	// Step 7: Close and reopen database to verify persistence
+	if err := db.Close(); err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+
+	// Reopen the database
+	db, err = Open(dbPath, options)
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+	defer db.Close()
+
+	//printValueCacheDebug(t, db, "After Step 7 - Reopen database")
+	//printKeyValueOffsets(t, db, []string{"key1", "key2", "key3", "key4"}, "After Step 7 - Reopen")
+	//printLeafPageDebug(t, db, 2, "After Step 7 - Reopen")
+
+	// Debug: Read raw values file content
+	//printValuesFileDebug(t, db)
+
+	// Verify all data is still present after reopen
+	for _, key := range allOrderedKeys {
+		expectedValue := allExpectedData[key]
+		value, err := db.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get %s after database reopen: %v", key, err)
+		}
+		if string(value) != expectedValue {
+			t.Fatalf("Expected %s = %s after reopen, got %s", key, expectedValue, string(value))
+		}
+	}
+
+	// Step 8: Add one more pair after reopen to test continued functionality
+	finalKey := "key5"
+	finalValue := "final_value_5"
+	if err := db.Set([]byte(finalKey), []byte(finalValue)); err != nil {
+		t.Fatalf("Failed to set %s after reopen: %v", finalKey, err)
+	}
+
+	// Verify the final key and all previous data
+	allFinalData := make(map[string]string)
+	for k, v := range allExpectedData {
+		allFinalData[k] = v
+	}
+	allFinalData[finalKey] = finalValue
+
+	finalOrderedKeys := []string{"key1", "key2", "key3", "key4", "key5"}
+	for _, key := range finalOrderedKeys {
+		expectedValue := allFinalData[key]
+		value, err := db.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get %s after final addition: %v", key, err)
+		}
+		if string(value) != expectedValue {
+			t.Fatalf("Expected %s = %s after final addition, got %s", key, expectedValue, string(value))
+		}
+	}
+
+	// Step 8: Close and reopen database to verify persistence
+	if err := db.Close(); err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+
+	// Reopen the database
+	db, err = Open(dbPath, options)
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+	defer db.Close()
+
+	for _, key := range finalOrderedKeys {
+		expectedValue := allFinalData[key]
+		value, err := db.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get %s after final addition: %v", key, err)
+		}
+		if string(value) != expectedValue {
+			t.Fatalf("Expected %s = %s after final addition, got %s", key, expectedValue, string(value))
+		}
+	}
+
+	// Step 9: Close and reopen database to verify persistence
+	if err := db.Close(); err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+
+	// Reopen the database
+	db, err = Open(dbPath, options)
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+	defer db.Close()
+
+	for _, key := range finalOrderedKeys {
+		expectedValue := allFinalData[key]
+		value, err := db.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get %s after final addition: %v", key, err)
+		}
+		if string(value) != expectedValue {
+			t.Fatalf("Expected %s = %s after final addition, got %s", key, expectedValue, string(value))
+		}
+	}
+}
+
+// Helper function to verify value cache contents
+func verifyValueCacheContents(t *testing.T, db *DB, expectedValues map[int64]string) {
+	db.valueCacheMutex.RLock()
+	defer db.valueCacheMutex.RUnlock()
+
+	for expectedOffset, expectedValue := range expectedValues {
+		entry, exists := db.valueCache[expectedOffset]
+		if !exists {
+			t.Fatalf("Expected offset %d to exist in value cache, but it doesn't", expectedOffset)
+		}
+
+		if expectedValue == "" {
+			// Expecting a deleted value (nil value)
+			if entry.value != nil {
+				t.Fatalf("Expected offset %d to have nil value (deleted), but got %q", expectedOffset, string(entry.value))
+			}
+		} else {
+			// Expecting a valid value
+			if entry.value == nil {
+				t.Fatalf("Expected offset %d to have value %q, but got nil", expectedOffset, expectedValue)
+			}
+			if string(entry.value) != expectedValue {
+				t.Fatalf("Expected offset %d to have value %q, but got %q", expectedOffset, expectedValue, string(entry.value))
+			}
+		}
+	}
 }
