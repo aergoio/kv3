@@ -1826,15 +1826,20 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 // storeValue stores a value in the value cache and returns its offset
 // If existingOffset is provided and the new value fits in the same space, it reuses the offset
 // Otherwise, it appends to the end of the values file (starting from PageSize to account for header)
-func (db *DB) storeValue(value []byte, existingOffset ...int64) (int64, error) {
+func (db *DB) storeValue(value []byte, existingOffsetArray ...int64) (int64, error) {
 	// Calculate the size needed for the new value
 	newValueSize := uint32(1 + varint.Size(uint64(len(value))) + len(value)) // 1 byte for type ('V')
 
+	var existingOffset int64
+	if len(existingOffsetArray) > 0 {
+		existingOffset = existingOffsetArray[0]
+	}
+
 	// Check if we should try to reuse an existing offset
-	if len(existingOffset) > 0 && existingOffset[0] > 0 {
+	if existingOffset > 0 {
 		// Try to reuse the existing offset if the value fits
 		db.valueCacheMutex.RLock()
-		existingEntry, exists := db.valueCache[existingOffset[0]]
+		existingEntry, exists := db.valueCache[existingOffset]
 		db.valueCacheMutex.RUnlock()
 
 		if exists && existingEntry.value != nil {
@@ -1852,13 +1857,13 @@ func (db *DB) storeValue(value []byte, existingOffset ...int64) (int64, error) {
 					isWAL:       false,
 					next:        existingEntry, // Link to previous version
 				}
-				db.valueCache[existingOffset[0]] = newEntry
+				db.valueCache[existingOffset] = newEntry
 				db.valueCacheMutex.Unlock()
 
 				// If there's leftover space (at least 3 bytes), add it to the free list
 				leftoverSize := existingValueSize - newValueSize
 				if leftoverSize >= 3 {
-					leftoverOffset := existingOffset[0] + int64(newValueSize)
+					leftoverOffset := existingOffset + int64(newValueSize)
 
 					varintSize := uint32(varint.Size(uint64(leftoverSize - 2)))
 					leftoverValueSize := leftoverSize - 1 - varintSize
@@ -1876,14 +1881,27 @@ func (db *DB) storeValue(value []byte, existingOffset ...int64) (int64, error) {
 					db.addToFreeValuesList(leftoverOffset, leftoverSize)
 
 					debugPrint("Reused existing offset %d for value, size %d, added %d bytes of leftover space at offset %d to free list\n",
-						existingOffset[0], newValueSize, leftoverSize, leftoverOffset)
+						existingOffset, newValueSize, leftoverSize, leftoverOffset)
 				} else {
-					debugPrint("Reused existing offset %d for value, size %d\n", existingOffset[0], newValueSize)
+					debugPrint("Reused existing offset %d for value, size %d\n", existingOffset, newValueSize)
 				}
 
-				return existingOffset[0], nil
+				return existingOffset, nil
 			}
 		}
+	}
+
+	// If there's an existing offset being replaced, add its space to free list
+	if existingOffset > 0 {
+		defer func() {
+			// Use deleteValue to mark the old space as deleted and add to free list
+			err := db.deleteValue(existingOffset)
+			if err != nil {
+				debugPrint("Warning: failed to delete old value at offset %d: %v\n", existingOffset, err)
+			} else {
+				debugPrint("Deleted old value at offset %d when reusing free space\n", existingOffset)
+			}
+		}()
 	}
 
 	// Try to find a suitable free space
