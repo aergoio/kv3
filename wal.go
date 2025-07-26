@@ -1034,7 +1034,11 @@ func (db *DB) copyWALValuesToValuesFile() error {
 		// Find the first WAL version
 		for ; entry != nil; entry = entry.next {
 			if entry.isWAL {
-				valueOffsets = append(valueOffsets, offset)
+				// Only add non-merged entries for writing
+				if !entry.merged {
+					valueOffsets = append(valueOffsets, offset)
+				}
+				// We only use the first WAL version
 				break
 			}
 		}
@@ -1058,8 +1062,8 @@ func (db *DB) copyWALValuesToValuesFile() error {
 		}
 		db.valueCacheMutex.RUnlock()
 
-		if entry == nil {
-			continue // No WAL entry found
+		if entry == nil || entry.merged {
+			continue // No WAL entry found or entry is merged
 		}
 
 		var valueData []byte

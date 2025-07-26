@@ -115,6 +115,7 @@ type ValueEntry struct {
 	valueSize   uint32      // Size of the value data only (without type + varint), stored even when value is nil
 	txnSequence int64       // Transaction sequence number when this value was written
 	isWAL       bool        // Whether this value is part of the WAL
+	merged      bool        // Whether this entry represents merged space (not actual data)
 	next        *ValueEntry // Pointer to the next entry with the same offset (for versioning)
 }
 
@@ -1846,6 +1847,41 @@ func (db *DB) storeValue(value []byte, existingOffsetArray ...int64) (int64, err
 			// Calculate the size of the existing value
 			existingValueSize := uint32(varint.Size(uint64(len(existingEntry.value))) + len(existingEntry.value) + 1)
 
+			// If the new value is larger than the existing value
+			if newValueSize > existingValueSize {
+				// Check if the adjacent space is free
+				nextOffset := existingOffset + int64(existingValueSize)
+				freeIndex, nextEntry := db.checkFreeValueAt(nextOffset)
+				if freeIndex >= 0 && nextEntry.value == nil && !nextEntry.merged {
+					// The adjacent space is free, let's check if the new value fits in the combined space
+					if newValueSize <= existingValueSize + nextEntry.valueSize {
+						// The new value fits in the combined space
+						// Remove the adjacent entry from the free values list
+						db.freeValues[freeIndex].Offset = 0
+						db.freeValues[freeIndex].Size = 0
+						db.freeValuesChanged = true
+
+						// Mark the adjacent entry as merged to avoid being saved to WAL/file as free space
+						db.valueCacheMutex.Lock()
+						mergedEntry := &ValueEntry{
+							value:       nil,       // Set to nil since this space is merged
+							valueSize:   nextEntry.valueSize,
+							txnSequence: db.txnSequence,
+							isWAL:       false,
+							merged:      true,      // Mark as merged space
+							next:        nextEntry, // Link to previous version
+						}
+						db.valueCache[nextOffset] = mergedEntry
+						db.valueCacheMutex.Unlock()
+
+						// Merge the existing value with the adjacent one
+						existingValueSize = existingValueSize + nextEntry.valueSize
+
+						debugPrint("Merged space at offset %d with size %d. New space size: %d\n", nextOffset, nextEntry.valueSize, existingValueSize)
+					}
+				}
+			}
+
 			// If the new value fits in the same space, reuse the offset
 			if newValueSize <= existingValueSize {
 				// Update the value in the cache with versioning
@@ -2166,6 +2202,23 @@ func (db *DB) findFreeValueSpace(neededSize uint32) int64 {
 	}
 
 	return 0 // No suitable free space found
+}
+
+// checkFreeValueAt checks if there's a free value entry at the specified offset
+// Returns the index in the freeValues array and the corresponding ValueEntry from cache
+// Returns -1 as index if not found in free values list
+func (db *DB) checkFreeValueAt(offset int64) (int, *ValueEntry) {
+	// Check if the offset exists in the free values list
+	for i, entry := range db.freeValues {
+		if entry.Offset == offset {
+			// Found in free values list, now get the ValueEntry from cache
+			db.valueCacheMutex.RLock()
+			valueEntry := db.valueCache[offset]
+			db.valueCacheMutex.RUnlock()
+			return i, valueEntry
+		}
+	}
+	return -1, nil
 }
 
 // addToFreeValuesList adds a deleted value to the free values list
@@ -3547,9 +3600,14 @@ func (db *DB) discardOldValueVersions(keepWAL bool) {
 			shouldStop := false
 
 			if current.isWAL {
-				// Keep only the very first WAL value
-				// If we are not keeping WAL values, discard it
-				shouldKeep = keepWAL
+				if current.merged {
+					// Merged entries should be discarded since they don't represent actual data
+					shouldKeep = false
+				} else {
+					// Keep only the very first WAL value
+					// If we are not keeping WAL values, discard it
+					shouldKeep = keepWAL
+				}
 				// Discard everything else after the first WAL value
 				shouldStop = true
 			} else {
@@ -3942,11 +4000,12 @@ func (db *DB) flushValuesToWAL() error {
 			continue
 		}
 
-		value := entry.value
-
-		// Write to WAL
-		if err := db.writeValueToWAL(offset, value, entry.valueSize); err != nil {
-			return fmt.Errorf("failed to write value at offset %d to WAL: %w", offset, err)
+		if !entry.merged {
+			// Write to WAL
+			value := entry.value
+			if err := db.writeValueToWAL(offset, value, entry.valueSize); err != nil {
+				return fmt.Errorf("failed to write value at offset %d to WAL: %w", offset, err)
+			}
 		}
 
 		// Mark this specific version as WAL
