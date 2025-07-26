@@ -2128,10 +2128,39 @@ func (db *DB) findFreeValueSpace(neededSize uint32) int64 {
 	if bestIndex >= 0 {
 		freeOffset := db.freeValues[bestIndex].Offset
 
-		// Mark the entry as used
-		db.freeValues[bestIndex].Offset = 0
-		db.freeValues[bestIndex].Size = 0
-		db.freeValuesChanged = true
+		// Calculate leftover space
+		leftoverSize := bestSize - neededSize
+
+		if leftoverSize >= 3 {
+			// Update the entry to point to the leftover space
+			leftoverOffset := freeOffset + int64(neededSize)
+			db.freeValues[bestIndex].Offset = leftoverOffset
+			db.freeValues[bestIndex].Size = leftoverSize
+			db.freeValuesChanged = true
+
+			// Create a cache entry for the leftover space
+			varintSize := uint32(varint.Size(uint64(leftoverSize - 2)))
+			leftoverValueSize := leftoverSize - 1 - varintSize
+
+			db.valueCacheMutex.Lock()
+			existingEntry := db.valueCache[leftoverOffset]
+			db.valueCache[leftoverOffset] = &ValueEntry{
+				value:       nil,
+				valueSize:   leftoverValueSize,
+				txnSequence: db.txnSequence,
+				isWAL:       false,
+				next:        existingEntry,
+			}
+			db.valueCacheMutex.Unlock()
+
+			debugPrint("Updated free entry to leftover space: offset=%d, size=%d\n", leftoverOffset, leftoverSize)
+		} else {
+			// Mark the entry as completely used (remove from free list)
+			db.freeValues[bestIndex].Offset = 0
+			db.freeValues[bestIndex].Size = 0
+			db.freeValuesChanged = true
+			debugPrint("Completely used free space (leftover %d < 3 bytes)\n", leftoverSize)
+		}
 
 		return freeOffset
 	}
