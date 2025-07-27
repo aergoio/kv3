@@ -1854,7 +1854,9 @@ func (db *DB) storeValue(value []byte, existingOffsetArray ...int64) (int64, err
 				freeIndex, nextEntry := db.checkFreeValueAt(nextOffset)
 				if freeIndex >= 0 && nextEntry.value == nil && !nextEntry.merged {
 					// The adjacent space is free, let's check if the new value fits in the combined space
-					if newValueSize <= existingValueSize + nextEntry.valueSize {
+					adjacentValueSize := db.freeValues[freeIndex].Size
+					combinedSize := existingValueSize + adjacentValueSize
+					if newValueSize == combinedSize || newValueSize + 3 <= combinedSize {
 						// The new value fits in the combined space
 						// Remove the adjacent entry from the free values list
 						db.freeValues[freeIndex].Offset = 0
@@ -1875,15 +1877,15 @@ func (db *DB) storeValue(value []byte, existingOffsetArray ...int64) (int64, err
 						db.valueCacheMutex.Unlock()
 
 						// Merge the existing value with the adjacent one
-						existingValueSize = existingValueSize + nextEntry.valueSize
+						existingValueSize = combinedSize
 
-						debugPrint("Merged space at offset %d with size %d. New space size: %d\n", nextOffset, nextEntry.valueSize, existingValueSize)
+						debugPrint("Merged space at offset %d with size %d. New space size: %d\n", nextOffset, adjacentValueSize, existingValueSize)
 					}
 				}
 			}
 
 			// If the new value fits in the same space, reuse the offset
-			if newValueSize <= existingValueSize {
+			if newValueSize == existingValueSize || newValueSize + 3 <= existingValueSize {
 				// Update the value in the cache with versioning
 				db.valueCacheMutex.Lock()
 				newEntry := &ValueEntry{
@@ -1934,8 +1936,6 @@ func (db *DB) storeValue(value []byte, existingOffsetArray ...int64) (int64, err
 			err := db.deleteValue(existingOffset)
 			if err != nil {
 				debugPrint("Warning: failed to delete old value at offset %d: %v\n", existingOffset, err)
-			} else {
-				debugPrint("Deleted old value at offset %d when reusing free space\n", existingOffset)
 			}
 		}()
 	}
@@ -2190,7 +2190,7 @@ func (db *DB) findFreeValueSpace(neededSize uint32) int64 {
 	var bestSize uint32 = 0
 
 	for i, entry := range db.freeValues {
-		if entry.Size >= neededSize {
+		if entry.Size == neededSize || entry.Size >= neededSize + 3 {
 			if bestIndex == -1 || entry.Size < bestSize {
 				bestIndex = i
 				bestSize = entry.Size
