@@ -2025,6 +2025,43 @@ func (db *DB) deleteValue(offset int64) error {
 		}
 	}
 
+	// Check if the next adjacent space is free and can be merged
+	nextOffset := offset + int64(segmentSize)
+
+	if nextOffset < db.valuesFileSize {
+		// Check if the adjacent space is free
+		freeIndex, nextEntry := db.checkFreeValueAt(nextOffset)
+		if freeIndex >= 0 && nextEntry != nil && nextEntry.value == nil && !nextEntry.merged {
+			// The adjacent space is free, merge it
+			debugPrint("Found adjacent free space at offset %d with size %d, merging\n", nextOffset, nextEntry.valueSize)
+
+			// Calculate the total size of the adjacent free space
+			// For free values, the entry stores the total segment size (type + varint + value)
+			adjacentSegmentSize := db.freeValues[freeIndex].Size
+			segmentSize += adjacentSegmentSize
+
+			// Remove the adjacent entry from the free values list
+			db.freeValues[freeIndex].Offset = 0
+			db.freeValues[freeIndex].Size = 0
+			db.freeValuesChanged = true
+
+			// Mark the adjacent entry as merged to avoid being saved to WAL/file as free space
+			db.valueCacheMutex.Lock()
+			mergedEntry := &ValueEntry{
+				value:       nil,       // Set to nil since this space is merged
+				valueSize:   nextEntry.valueSize,
+				txnSequence: db.txnSequence,
+				isWAL:       false,
+				merged:      true,      // Mark as merged space
+				next:        nextEntry, // Link to previous version
+			}
+			db.valueCache[nextOffset] = mergedEntry
+			db.valueCacheMutex.Unlock()
+
+			debugPrint("Merged adjacent space at offset %d with size %d. New merged size: %d\n", nextOffset, adjacentSegmentSize, segmentSize)
+		}
+	}
+
 	// Mark as deleted by storing an empty value with versioning
 	db.valueCacheMutex.Lock()
 	currentEntry := db.valueCache[offset]
