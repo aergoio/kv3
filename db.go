@@ -1828,8 +1828,10 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 // If existingOffset is provided and the new value fits in the same space, it reuses the offset
 // Otherwise, it appends to the end of the values file (starting from PageSize to account for header)
 func (db *DB) storeValue(value []byte, existingOffsetArray ...int64) (int64, error) {
+	valueSize := len(value)
+
 	// Calculate the size needed for the new value
-	newValueSize := uint32(1 + varint.Size(uint64(len(value))) + len(value)) // 1 byte for type ('V')
+	newValueSize := uint32(1 + varint.Size(uint64(valueSize)) + valueSize) // 1 byte for type ('V')
 
 	var existingOffset int64
 	if len(existingOffsetArray) > 0 {
@@ -1852,7 +1854,8 @@ func (db *DB) storeValue(value []byte, existingOffsetArray ...int64) (int64, err
 				// Check if the adjacent space is free
 				nextOffset := existingOffset + int64(existingValueSize)
 				freeIndex, nextEntry := db.checkFreeValueAt(nextOffset)
-				if freeIndex >= 0 && nextEntry.value == nil && !nextEntry.merged {
+				if freeIndex >= 0 && nextEntry != nil && nextEntry.value == nil && !nextEntry.merged {
+					debugPrint("Adjacent space is free - checking if new value fits in combined space\n")
 					// The adjacent space is free, let's check if the new value fits in the combined space
 					adjacentValueSize := db.freeValues[freeIndex].Size
 					combinedSize := existingValueSize + adjacentValueSize
@@ -2241,6 +2244,82 @@ func (db *DB) findFreeValueSpace(neededSize uint32) int64 {
 	return 0 // No suitable free space found
 }
 
+// loadValueEntryFromFile loads a ValueEntry from the values file and adds it to cache
+// Returns the loaded ValueEntry or nil if loading failed
+func (db *DB) loadValueEntryFromFile(offset int64, onlyDeleted bool) (*ValueEntry, int) {
+	// Values start at PageSize (4096) due to header
+	if offset < PageSize || offset >= db.valuesFileSize {
+		return nil, 0
+	}
+
+	// Read the type byte first
+	typeBuf := make([]byte, 1)
+	if _, err := db.valuesFile.ReadAt(typeBuf, offset); err != nil {
+		return nil, 0
+	}
+
+	valueType := typeBuf[0]
+	var varintSize int
+	var valueSize int
+	var segmentSize int
+	currentOffset := offset + 1
+	var valueEntry *ValueEntry
+
+	// Read the value size to get the full size
+	sizeBuf := make([]byte, 10) // Enough for varint
+	if _, err := db.valuesFile.ReadAt(sizeBuf, currentOffset); err != nil {
+		return nil, 0
+	}
+	valueSize64, varintSize := varint.Read(sizeBuf)
+	valueSize = int(valueSize64)
+	segmentSize = 1 + varintSize + valueSize
+	currentOffset += int64(varintSize)
+
+	// Handle deleted values ('F' type)
+	if valueType == 'F' {
+		debugPrint("Deleted value at offset %d, size %d, segment size %d\n", offset, valueSize, segmentSize)
+		if segmentSize >= 3 {
+			valueEntry = &ValueEntry{
+				value:       nil, // Deleted value
+				valueSize:   uint32(valueSize),
+				txnSequence: 0, // Unknown transaction sequence from file
+				isWAL:       false,
+				next:        nil,
+			}
+		}
+	} else if valueType == 'V' && !onlyDeleted {
+		debugPrint("Regular value at offset %d, size %d, segment size %d\n", offset, valueSize, segmentSize)
+		// Handle regular values ('V' type)
+		// Read the value data
+		valueData := make([]byte, valueSize)
+		if _, err := db.valuesFile.ReadAt(valueData, currentOffset); err != nil {
+			return nil, 0
+		}
+		valueEntry = &ValueEntry{
+			value:       valueData,
+			valueSize:   uint32(valueSize),
+			txnSequence: 0, // Unknown transaction sequence from file
+			isWAL:       false,
+			next:        nil,
+		}
+	}
+
+	// Add to cache if successfully loaded
+	if valueEntry != nil {
+		db.valueCacheMutex.Lock()
+		// Check if another goroutine already loaded it
+		if existing := db.valueCache[offset]; existing == nil {
+			db.valueCache[offset] = valueEntry
+		} else {
+			// Use the existing entry (race condition)
+			valueEntry = existing
+		}
+		db.valueCacheMutex.Unlock()
+	}
+
+	return valueEntry, segmentSize
+}
+
 // checkFreeValueAt checks if there's a free value entry at the specified offset
 // Returns the index in the freeValues array and the corresponding ValueEntry from cache
 // Returns -1 as index if not found in free values list
@@ -2252,6 +2331,11 @@ func (db *DB) checkFreeValueAt(offset int64) (int, *ValueEntry) {
 			db.valueCacheMutex.RLock()
 			valueEntry := db.valueCache[offset]
 			db.valueCacheMutex.RUnlock()
+			// Load the value entry from the values file
+			if valueEntry == nil {
+				valueEntry, _ = db.loadValueEntryFromFile(offset, true)
+			}
+			debugPrint("Returning value entry: %v\n", valueEntry)
 			return i, valueEntry
 		}
 	}
@@ -2466,53 +2550,25 @@ func (db *DB) getDeletedValueSize(offset int64) uint32 {
 
 	if entry != nil {
 		// If the cached entry has a non-nil value, this space is not free
-		if entry.value != nil {
+		if entry.value != nil || entry.merged {
 			return 0
 		}
-		// If the cached entry has nil value (deleted), calculate total segment size from value size
-		if entry.valueSize > 0 {
-			return uint32(1 + varint.Size(uint64(entry.valueSize)) + int(entry.valueSize))
+		// Get the value size
+		valueSize := len(entry.value)
+		if valueSize == 0 {
+			valueSize = int(entry.valueSize)
 		}
-		// If no size stored, try to find the original size from version chain
-		for prev := entry.next; prev != nil; prev = prev.next {
-			if prev.valueSize > 0 {
-				return uint32(1 + varint.Size(uint64(prev.valueSize)) + int(prev.valueSize))
-			}
-			if prev.value != nil {
-				// Found the original value, calculate its size
-				return uint32(1 + varint.Size(uint64(len(prev.value))) + len(prev.value))
-			}
-		}
-		// If we can't find the original size from cache, fall through to file reading
+		// Calculate total segment size
+		return uint32(1 + varint.Size(uint64(valueSize)) + valueSize)
 	}
 
-	// No cache entry, read from file to get the deleted value size
-	if offset < PageSize || offset >= db.valuesFileSize {
-		return 0
+	// If no entry was found in cache, try to load from file
+	entry, segmentSize := db.loadValueEntryFromFile(offset, true)
+	if entry != nil {
+		return uint32(segmentSize)
 	}
 
-	// Read the type byte first
-	typeBuf := make([]byte, 1)
-	if _, err := db.valuesFile.ReadAt(typeBuf, offset); err != nil {
-		return 0
-	}
-
-	// Only process if it's a deleted value ('F')
-	if typeBuf[0] != 'F' {
-		return 0
-	}
-
-	// Read the value size varint
-	sizeBuf := make([]byte, 10) // Enough for varint
-	if _, err := db.valuesFile.ReadAt(sizeBuf, offset+1); err != nil {
-		return 0
-	}
-
-	if valueSize, bytesRead := varint.Read(sizeBuf); bytesRead > 0 {
-		// Return total size: type(1) + varint size + value size
-		return uint32(1 + bytesRead + int(valueSize))
-	}
-
+	// If no entry was found even after trying to load from file, return 0
 	return 0
 }
 
