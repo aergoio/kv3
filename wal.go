@@ -634,6 +634,13 @@ func (db *DB) scanWAL() error {
 			db.valueCache[valueOffset] = newEntry
 			db.valueCacheMutex.Unlock()
 
+			// Update values file size if necessary when loading values from WAL
+			// This ensures that valuesFileSize reflects the highest offset with data
+			finalOffset := valueOffset + int64(segmentSize)
+			if finalOffset > db.valuesFileSize {
+				db.valuesFileSize = finalOffset
+			}
+
 			// Move to the next frame
 			offset += WalFrameHeaderSize + int64(segmentSize)
 
@@ -692,8 +699,7 @@ func (db *DB) scanWAL() error {
 		return db.resetWAL()
 	}
 
-	// Update the index file size to account for WAL pages
-	return db.RefreshFileSize()
+	return nil
 }
 
 // walCommit writes a commit record to the WAL file
@@ -932,12 +938,6 @@ func (db *DB) copyValuesToValuesFile(commitSequence int64) error {
 		// Write the value data to the values file
 		if _, err := db.valuesFile.WriteAt(valueData, offset); err != nil {
 			return fmt.Errorf("failed to write value at offset %d to values file: %w", offset, err)
-		}
-
-		// Update values file size if necessary (only if we're extending the file)
-		finalOffset := offset + int64(len(valueData))
-		if finalOffset > db.valuesFileSize {
-			db.valuesFileSize = finalOffset
 		}
 	}
 

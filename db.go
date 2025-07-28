@@ -1311,7 +1311,7 @@ func (db *DB) initializeIndexFile() error {
 	//	return fmt.Errorf("failed to flush index to disk: %w", err)
 	//}
 
-	return nil
+	return db.RefreshFileSize()
 }
 
 // initializeValuesFile initializes the values file with a header
@@ -1382,7 +1382,7 @@ func (db *DB) readHeader() error {
 		return fmt.Errorf("failed to preload radix levels: %w", err)
 	}
 
-	return nil
+	return db.RefreshFileSize()
 }
 
 // readIndexFileHeader reads the index file header
@@ -1959,7 +1959,7 @@ func (db *DB) storeValue(value []byte, existingOffsetArray ...int64) (int64, err
 	// Ensure we start from PageSize (4096) if the file only contains header
 	offset := db.valuesFileSize
 	if offset < PageSize {
-		offset = PageSize
+		return 0, fmt.Errorf("values file size is less than PageSize")
 	}
 
 	// Update the values file size
@@ -3024,14 +3024,26 @@ func (db *DB) RefreshFileSize() error {
 	if err != nil {
 		return fmt.Errorf("failed to get index file size: %w", err)
 	}
-	db.indexFileSize = indexFileInfo.Size()
+	if indexFileInfo.Size() > db.indexFileSize {
+		db.indexFileSize = indexFileInfo.Size()
+	}
 
 	// Refresh values file size
 	valuesFileInfo, err := db.valuesFile.Stat()
 	if err != nil {
 		return fmt.Errorf("failed to get values file size: %w", err)
 	}
-	db.valuesFileSize = valuesFileInfo.Size()
+	if valuesFileInfo.Size() > db.valuesFileSize {
+		db.valuesFileSize = valuesFileInfo.Size()
+	}
+
+	// Iterate over all free values and update the values file size
+	for _, freeValue := range db.freeValues {
+		finalOffset := freeValue.Offset + int64(freeValue.Size)
+		if finalOffset > db.valuesFileSize {
+			db.valuesFileSize = finalOffset
+		}
+	}
 
 	return nil
 }
