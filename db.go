@@ -1846,6 +1846,9 @@ func (db *DB) storeValue(value []byte, existingOffsetArray ...int64) (int64, err
 		// Try to reuse the existing offset if the value fits
 		db.valueCacheMutex.RLock()
 		existingEntry, exists := db.valueCache[existingOffset]
+		if existingEntry != nil {
+			existingEntry.accessTime = db.getNextAccessTime()
+		}
 		db.valueCacheMutex.RUnlock()
 
 		if exists && existingEntry.value != nil {
@@ -2023,7 +2026,8 @@ func (db *DB) deleteValue(offset int64) error {
 
 	// Try to get size from cache first
 	db.valueCacheMutex.RLock()
-	if entry, exists := db.valueCache[offset]; exists {
+	if entry := db.valueCache[offset]; entry != nil {
+		entry.accessTime = db.getNextAccessTime()
 		if entry.valueSize > 0 {
 			// Use the stored value size from the cache entry
 			valueSize = entry.valueSize
@@ -2154,6 +2158,9 @@ func (db *DB) readValue(offset int64, maxReadSeq ...int64) ([]byte, error) {
 	// First check the value cache
 	db.valueCacheMutex.RLock()
 	entry, exists := db.valueCache[offset]
+	if entry != nil {
+		entry.accessTime = db.getNextAccessTime()
+	}
 
 	// If maxReadSequence is specified, find the latest version that's <= maxReadSequence
 	if exists && maxReadSequence > 0 {
@@ -2372,6 +2379,9 @@ func (db *DB) checkFreeValueAt(offset int64) (int, *ValueEntry) {
 			debugPrint("Found free value at offset %d in free values list\n", offset)
 			db.valueCacheMutex.RLock()
 			valueEntry := db.valueCache[offset]
+			if valueEntry != nil {
+				valueEntry.accessTime = db.getNextAccessTime()
+			}
 			db.valueCacheMutex.RUnlock()
 			// Load the value entry from the values file
 			if valueEntry == nil {
@@ -2487,6 +2497,9 @@ func (db *DB) loadFreeValues() error {
 	// Try to read from WAL/cache (offset 32 is where free values are stored)
 	db.valueCacheMutex.RLock()
 	entry, exists := db.valueCache[FreeValuesListOffset]
+	if entry != nil {
+		entry.accessTime = db.getNextAccessTime()
+	}
 	db.valueCacheMutex.RUnlock()
 
 	// Use the cached/WAL version if available
@@ -2554,6 +2567,9 @@ func (db *DB) restoreFreeValuesArray() {
 	// Find the previous version of the free values list in the cache
 	db.valueCacheMutex.RLock()
 	entry, exists := db.valueCache[FreeValuesListOffset]
+	if entry != nil {
+		entry.accessTime = db.getNextAccessTime()
+	}
 
 	// Look for the version from before this transaction
 	for exists && entry != nil {
@@ -2588,6 +2604,9 @@ func (db *DB) getDeletedValueSize(offset int64) uint32 {
 	// First check the value cache
 	db.valueCacheMutex.RLock()
 	entry := db.valueCache[offset]
+	if entry != nil {
+		entry.accessTime = db.getNextAccessTime()
+	}
 	db.valueCacheMutex.RUnlock()
 
 	if entry != nil {
