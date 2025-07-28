@@ -629,6 +629,8 @@ func (db *DB) scanWAL() error {
 				valueSize:   entryValueSize,
 				txnSequence: commitSequence,
 				isWAL:       true,
+				dirty:       false, // Values loaded from WAL are not dirty
+				accessTime:  db.getNextAccessTime(),
 				next:        existingEntry, // Link to previous version
 			}
 			db.valueCache[valueOffset] = newEntry

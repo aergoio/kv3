@@ -116,6 +116,8 @@ type ValueEntry struct {
 	txnSequence int64       // Transaction sequence number when this value was written
 	isWAL       bool        // Whether this value is part of the WAL
 	merged      bool        // Whether this entry represents merged space (not actual data)
+	dirty       bool        // Whether this value has been modified and needs to be written to WAL
+	accessTime  uint64      // Last access time for LRU cache eviction
 	next        *ValueEntry // Pointer to the next entry with the same offset (for versioning)
 }
 
@@ -1222,6 +1224,12 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 
 // Helper functions
 
+// getNextAccessTime returns the next access time and increments the counter
+func (db *DB) getNextAccessTime() uint64 {
+	db.accessCounter++
+	return db.accessCounter
+}
+
 // initialize creates a new database file structure
 func (db *DB) initialize() error {
 
@@ -1831,6 +1839,8 @@ func (db *DB) storeValue(value []byte, existingOffsetArray ...int64) (int64, err
 		existingOffset = existingOffsetArray[0]
 	}
 
+	debugPrint("Storing value with size %d, existing offset: %v\n", valueSize, existingOffset)
+
 	// Check if we should try to reuse an existing offset
 	if existingOffset > 0 {
 		// Try to reuse the existing offset if the value fits
@@ -1842,8 +1852,11 @@ func (db *DB) storeValue(value []byte, existingOffsetArray ...int64) (int64, err
 			// Calculate the size of the existing value
 			existingValueSize := uint32(varint.Size(uint64(len(existingEntry.value))) + len(existingEntry.value) + 1)
 
+			debugPrint("Existing value size: %d\n", existingValueSize)
+
 			// If the new value is larger than the existing value
 			if newValueSize > existingValueSize {
+				debugPrint("New value size is larger than existing value size - checking adjacent space\n")
 				// Check if the adjacent space is free
 				nextOffset := existingOffset + int64(existingValueSize)
 				freeIndex, nextEntry := db.checkFreeValueAt(nextOffset)
@@ -1853,6 +1866,7 @@ func (db *DB) storeValue(value []byte, existingOffsetArray ...int64) (int64, err
 					adjacentValueSize := db.freeValues[freeIndex].Size
 					combinedSize := existingValueSize + adjacentValueSize
 					if newValueSize == combinedSize || newValueSize + 3 <= combinedSize {
+						debugPrint("New value fits in combined space\n")
 						// The new value fits in the combined space
 						// Remove the adjacent entry from the free values list
 						db.freeValues[freeIndex].Offset = 0
@@ -1867,6 +1881,8 @@ func (db *DB) storeValue(value []byte, existingOffsetArray ...int64) (int64, err
 							txnSequence: db.txnSequence,
 							isWAL:       false,
 							merged:      true,      // Mark as merged space
+							dirty:       false,     // Merged entries don't need to be written
+							accessTime:  db.getNextAccessTime(),
 							next:        nextEntry, // Link to previous version
 						}
 						db.valueCache[nextOffset] = mergedEntry
@@ -1882,6 +1898,7 @@ func (db *DB) storeValue(value []byte, existingOffsetArray ...int64) (int64, err
 
 			// If the new value fits in the same space, reuse the offset
 			if newValueSize == existingValueSize || newValueSize + 3 <= existingValueSize {
+				debugPrint("New value fits in the same space\n")
 				// Update the value in the cache with versioning
 				db.valueCacheMutex.Lock()
 				newEntry := &ValueEntry{
@@ -1889,6 +1906,8 @@ func (db *DB) storeValue(value []byte, existingOffsetArray ...int64) (int64, err
 					valueSize:   uint32(len(value)),
 					txnSequence: db.txnSequence,
 					isWAL:       false,
+					dirty:       true, // New/modified value is dirty
+					accessTime:  db.getNextAccessTime(),
 					next:        existingEntry, // Link to previous version
 				}
 				db.valueCache[existingOffset] = newEntry
@@ -1897,17 +1916,22 @@ func (db *DB) storeValue(value []byte, existingOffsetArray ...int64) (int64, err
 				// If there's leftover space (at least 3 bytes), add it to the free list
 				leftoverSize := existingValueSize - newValueSize
 				if leftoverSize >= 3 {
+					debugPrint("Leftover space is at least 3 bytes\n")
 					leftoverOffset := existingOffset + int64(newValueSize)
 
 					varintSize := uint32(varint.Size(uint64(leftoverSize - 2)))
 					leftoverValueSize := leftoverSize - 1 - varintSize
 
 					db.valueCacheMutex.Lock()
+					previousEntry := db.valueCache[leftoverOffset]
 					db.valueCache[leftoverOffset] = &ValueEntry{
 						value:       nil,
 						valueSize:   leftoverValueSize,
 						txnSequence: db.txnSequence,
 						isWAL:       false,
+						dirty:       true,
+						accessTime:  db.getNextAccessTime(),
+						next:        previousEntry,
 					}
 					db.valueCacheMutex.Unlock()
 
@@ -1938,6 +1962,7 @@ func (db *DB) storeValue(value []byte, existingOffsetArray ...int64) (int64, err
 
 	// Try to find a suitable free space
 	if freeOffset := db.findFreeValueSpace(newValueSize); freeOffset > 0 {
+		debugPrint("Found free space at offset %d for value, size %d\n", freeOffset, newValueSize)
 		// Store the value in the cache with versioning support
 		db.valueCacheMutex.Lock()
 		existingEntry := db.valueCache[freeOffset]
@@ -1946,6 +1971,8 @@ func (db *DB) storeValue(value []byte, existingOffsetArray ...int64) (int64, err
 			valueSize:   uint32(len(value)),
 			txnSequence: db.txnSequence,
 			isWAL:       false,
+			dirty:       true, // New value is dirty
+			accessTime:  db.getNextAccessTime(),
 			next:        existingEntry, // Link to previous version if it exists
 		}
 		db.valueCache[freeOffset] = newEntry
@@ -1954,6 +1981,8 @@ func (db *DB) storeValue(value []byte, existingOffsetArray ...int64) (int64, err
 		debugPrint("Reused free space at offset %d for value, size %d\n", freeOffset, newValueSize)
 		return freeOffset, nil
 	}
+
+	debugPrint("No free space found, allocating new offset\n")
 
 	// Allocate a new offset at the end of the values file
 	// Ensure we start from PageSize (4096) if the file only contains header
@@ -1973,6 +2002,8 @@ func (db *DB) storeValue(value []byte, existingOffsetArray ...int64) (int64, err
 		valueSize:   uint32(len(value)),
 		txnSequence: db.txnSequence,
 		isWAL:       false,
+		dirty:       true, // New value is dirty
+		accessTime:  db.getNextAccessTime(),
 		next:        existingEntry, // Link to previous version if it exists
 	}
 	db.valueCache[offset] = newEntry
@@ -1987,6 +2018,8 @@ func (db *DB) deleteValue(offset int64) error {
 	// First, get the size of the value being deleted
 	var valueSize uint32
 	var segmentSize uint32
+
+	debugPrint("Deleting value at offset %d\n", offset)
 
 	// Try to get size from cache first
 	db.valueCacheMutex.RLock()
@@ -2021,6 +2054,11 @@ func (db *DB) deleteValue(offset int64) error {
 		}
 	}
 
+	if valueSize == 0 || segmentSize == 0 {
+		debugPrint("Value at offset %d is already deleted or has no size\n", offset)
+		return nil
+	}
+
 	// Check if the next adjacent space is free and can be merged
 	nextOffset := offset + int64(segmentSize)
 
@@ -2049,6 +2087,8 @@ func (db *DB) deleteValue(offset int64) error {
 				txnSequence: db.txnSequence,
 				isWAL:       false,
 				merged:      true,      // Mark as merged space
+				dirty:       false,     // Merged entries don't need to be written
+				accessTime:  db.getNextAccessTime(),
 				next:        nextEntry, // Link to previous version
 			}
 			db.valueCache[nextOffset] = mergedEntry
@@ -2076,6 +2116,8 @@ func (db *DB) deleteValue(offset int64) error {
 			valueSize:   valueSize, // Preserve the value size for free-list tracking
 			txnSequence: db.txnSequence,
 			isWAL:       false,
+			dirty:       true, // Deleted value is dirty (needs to be written to WAL)
+			accessTime:  db.getNextAccessTime(),
 			next:        currentEntry, // Link to previous version
 		}
 		db.valueCache[offset] = newEntry
@@ -2218,6 +2260,8 @@ func (db *DB) findFreeValueSpace(neededSize uint32) int64 {
 				valueSize:   leftoverValueSize,
 				txnSequence: db.txnSequence,
 				isWAL:       false,
+				dirty:       true, // Leftover space is dirty (needs to be written to WAL)
+				accessTime:  db.getNextAccessTime(),
 				next:        existingEntry,
 			}
 			db.valueCacheMutex.Unlock()
@@ -2277,6 +2321,8 @@ func (db *DB) loadValueEntryFromFile(offset int64, onlyDeleted bool) (*ValueEntr
 				valueSize:   uint32(valueSize),
 				txnSequence: 0, // Unknown transaction sequence from file
 				isWAL:       false,
+				dirty:       false, // Loaded from file, not dirty
+				accessTime:  db.getNextAccessTime(),
 				next:        nil,
 			}
 		}
@@ -2293,6 +2339,8 @@ func (db *DB) loadValueEntryFromFile(offset int64, onlyDeleted bool) (*ValueEntr
 			valueSize:   uint32(valueSize),
 			txnSequence: 0, // Unknown transaction sequence from file
 			isWAL:       false,
+			dirty:       false, // Loaded from file, not dirty
+			accessTime:  db.getNextAccessTime(),
 			next:        nil,
 		}
 	}
@@ -2321,6 +2369,7 @@ func (db *DB) checkFreeValueAt(offset int64) (int, *ValueEntry) {
 	for i, entry := range db.freeValues {
 		if entry.Offset == offset {
 			// Found in free values list, now get the ValueEntry from cache
+			debugPrint("Found free value at offset %d in free values list\n", offset)
 			db.valueCacheMutex.RLock()
 			valueEntry := db.valueCache[offset]
 			db.valueCacheMutex.RUnlock()
@@ -2410,6 +2459,8 @@ func (db *DB) writeFreeValuesArray() error {
 		valueSize:   uint32(len(buffer)), // For free-list, this is the raw buffer size
 		txnSequence: db.txnSequence,
 		isWAL:       false,
+		dirty:       true, // Free values list changes are dirty
+		accessTime:  db.getNextAccessTime(),
 		next:        existingEntry,
 	}
 	db.valueCache[FreeValuesListOffset] = freeValuesEntry
@@ -3485,6 +3536,8 @@ func (db *DB) checkPageCache(isWrite bool) {
 		if db.commitMode == CallerThread {
 			// Discard previous versions of values
 			db.discardOldValueVersions(true)
+			// Remove old values from cache based on LRU
+			db.removeOldValuesFromCache()
 			// Discard previous versions of pages
 			numPages := db.discardOldPageVersions(true)
 			// If the number of pages is still greater than the cache size threshold
@@ -3773,7 +3826,6 @@ func (db *DB) removeOldPagesFromCache() {
 	numPagesToRemove := totalPages - targetSize
 
 	debugPrint("Discarding old pages from cache. Current cache size: %d, target size: %d\n", totalPages, targetSize)
-	return
 
 	// Step 1: Use read locks to collect candidates
 	var candidates []pageInfo
@@ -3862,6 +3914,51 @@ func (db *DB) removeOldPagesFromCache() {
 	db.totalCachePages.Add(-int64(removedCount))
 
 	debugPrint("Removed %d pages from cache, new size: %d\n", removedCount, db.totalCachePages.Load())
+}
+
+// removeOldValuesFromCache removes old clean values from the cache based on access time
+// It cannot remove values that are dirty, part of WAL, or from current transaction
+func (db *DB) removeOldValuesFromCache() {
+	// Get current access counter and calculate threshold
+	db.seqMutex.Lock()
+	var currentTxnSeq int64
+	// If the main thread is in a transaction
+	if db.inTransaction {
+		// Keep values from the previous transaction (because the current one can be rolled back)
+		currentTxnSeq = db.txnSequence - 1
+	} else {
+		// Otherwise, keep values from the last committed transaction
+		currentTxnSeq = db.txnSequence
+	}
+	// Remove values that haven't been accessed in the last 200 access cycles
+	accessThreshold := db.accessCounter - 200
+	db.seqMutex.Unlock()
+
+	debugPrint("Removing values from cache with accessTime < %d\n", accessThreshold)
+
+	// Remove old values directly
+	removedCount := 0
+	db.valueCacheMutex.Lock()
+	for offset, entry := range db.valueCache {
+		// Skip dirty values, WAL values, merged values, and values from the current transaction
+		if entry.dirty || entry.isWAL || entry.merged || entry.txnSequence >= currentTxnSeq {
+			continue
+		}
+
+		// Keep deleted values (value == nil && !merged) as they represent free space info
+		if entry.value == nil && !entry.merged {
+			continue
+		}
+
+		// Remove if access time is below threshold
+		if entry.accessTime < accessThreshold {
+			delete(db.valueCache, offset)
+			removedCount++
+		}
+	}
+	db.valueCacheMutex.Unlock()
+
+	debugPrint("Removed %d old values from cache\n", removedCount)
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -4066,8 +4163,8 @@ func (db *DB) flushValuesToWAL() error {
 				break
 			}
 		}
-		// Only flush values that are not already in WAL and within the flush sequence
-		if entry != nil && !entry.isWAL {
+		// Only flush values that are dirty, not already in WAL, and within the flush sequence
+		if entry != nil && entry.dirty && !entry.isWAL {
 			offsets = append(offsets, offset)
 		}
 	}
@@ -4104,8 +4201,9 @@ func (db *DB) flushValuesToWAL() error {
 			}
 		}
 
-		// Mark this specific version as WAL
+		// Mark this specific version as WAL and no longer dirty
 		entry.isWAL = true
+		entry.dirty = false
 	}
 
 	return nil
@@ -5659,6 +5757,8 @@ func (db *DB) startBackgroundWorker() {
 				case "clean":
 					// Discard previous versions of values
 					db.discardOldValueVersions(true)
+					// Remove old values from cache based on LRU
+					db.removeOldValuesFromCache()
 					// Discard previous versions of pages
 					numPages := db.discardOldPageVersions(true)
 					// If the number of pages is still greater than the cache size threshold
