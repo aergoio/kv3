@@ -1374,8 +1374,8 @@ func (db *DB) readHeader() error {
 		return fmt.Errorf("failed to read index file header from WAL: %w", err)
 	}
 
-	// Read the free values list from WAL/cache now that WAL is available
-	db.readFreeValuesFromWAL()
+	// Read the free values list now that the WAL cache is available
+	db.loadFreeValues()
 
 	// Preload the first two levels of the radix tree
 	if err := db.preloadRadixLevels(); err != nil {
@@ -1489,13 +1489,6 @@ func (db *DB) readValuesFileHeader() error {
 	// Ensure values file size is at least PageSize to account for header
 	if db.valuesFileSize < PageSize {
 		db.valuesFileSize = PageSize
-	}
-
-	// Read the free values list from the file (will be updated later from WAL if available)
-	if err := db.readFreeValuesFromFile(); err != nil {
-		debugPrint("Failed to read free values list: %v\n", err)
-		// Initialize empty array if reading fails
-		db.freeValues = make([]FreeValueEntry, 0, MaxFreeValueEntries)
 	}
 
 	return nil
@@ -2436,6 +2429,27 @@ func (db *DB) writeFreeValuesArray() error {
 	return nil
 }
 
+// loadFreeValues reads the free values list from WAL/cache if available
+func (db *DB) loadFreeValues() error {
+	debugPrint("Loading free values list\n")
+
+	// Try to read from WAL/cache (offset 32 is where free values are stored)
+	db.valueCacheMutex.RLock()
+	entry, exists := db.valueCache[FreeValuesListOffset]
+	db.valueCacheMutex.RUnlock()
+
+	// Use the cached/WAL version if available
+	if exists && entry.value != nil {
+		db.parseFreeValues(entry.value)
+		debugPrint("Loaded %d free values from WAL\n", len(db.freeValues))
+		return nil
+	}
+
+	// No WAL cache available, load from file
+	debugPrint("No WAL cache available, loading from file\n")
+	return db.readFreeValuesFromFile()
+}
+
 // readFreeValuesFromFile reads the free values list from the values file header
 func (db *DB) readFreeValuesFromFile() error {
 	// Read the free values list from offset 32 in the values file
@@ -2451,29 +2465,6 @@ func (db *DB) readFreeValuesFromFile() error {
 
 	debugPrint("Read %d free values from file\n", len(db.freeValues))
 	return nil
-}
-
-// readFreeValuesFromWAL reads the free values list from WAL/cache if available
-func (db *DB) readFreeValuesFromWAL() {
-	debugPrint("Reading free values list from WAL/cache\n")
-
-	// Try to read from WAL/cache (offset 32 is where free values are stored)
-	db.valueCacheMutex.RLock()
-	entry, exists := db.valueCache[FreeValuesListOffset]
-	if !exists || entry.value == nil {
-		db.valueCacheMutex.RUnlock()
-		// No WAL version available, keep current values
-		return
-	}
-
-	// Use the cached/WAL version
-	buffer := make([]byte, len(entry.value))
-	copy(buffer, entry.value)
-	db.valueCacheMutex.RUnlock()
-
-	db.parseFreeValues(buffer)
-
-	debugPrint("Read %d free values from WAL\n", len(db.freeValues))
 }
 
 // parseFreeValues parses a buffer containing free value offsets and populates the freeValues slice
