@@ -12,6 +12,13 @@ import (
 	//"github.com/aergoio/kv3/varint"
 )
 
+// cleanupTestFiles removes test database files (main, index, and wal)
+func cleanupTestFiles(dbPath string) {
+	os.Remove(dbPath + "-keys")
+	os.Remove(dbPath + "-values")
+	os.Remove(dbPath + "-wal")
+}
+
 func TestDatabaseBasicOperations(t *testing.T) {
 	// Create a test database
 	dbPath := "test_basic.db"
